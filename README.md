@@ -137,6 +137,8 @@ List imported bases:
 cargo run -- base list
 ```
 
+Base names are not replaced in place. If you want to capture a new image under an existing base name, remove or rename the old base first, then run `base capture` again.
+
 Imported bases live under:
 
 ```text
@@ -335,7 +337,7 @@ The built-in runtime launches:
 - the host checkout as a `virtio-fs` share with mount tag `workspace`
 - a guest console log at `runtime/console.log`
 - SSH as the shell/control plane
-- SSH `-L` tunnels for deterministic branch-local host ports
+- a higher file descriptor limit for the host-side VM launcher process
 
 Cloud-init is enabled by default for VM launches. `vibebox` will:
 
@@ -347,6 +349,7 @@ Cloud-init is enabled by default for VM launches. `vibebox` will:
 - auto-mount any extra `--share` `virtio-fs` directories you configured
 - create `~/workspace` as a symlink to `/workspace`
 - install and start `avahi-daemon` so the guest hostname is advertised over mDNS as `<hostname>.local`
+- write guest `nofile` limits for the default user and root
 - write `cloud-init/files/user-data` and `cloud-init/files/meta-data`
 - build `cloud-init/seed.iso` with volume label `CIDATA`
 
@@ -393,5 +396,7 @@ The launcher receives:
 - `VIBEBOX_INTERFACE_ID`
 - `VIBEBOX_SSH_PRIVATE_KEY`
 - `VIBEBOX_PORTS` as `host:guest,host:guest,...`
+
+`VIBEBOX_PORTS` is metadata about the reserved host/guest port mapping block. The built-in runtime does not create localhost port forwards automatically.
 
 If neither `VIBEBOX_VM_LAUNCHER` nor the built-in `krunkit` + `vmnet-helper` path is available, `vibebox launch` will fail unless you explicitly pass `--shell`.
