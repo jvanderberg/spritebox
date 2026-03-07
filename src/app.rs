@@ -2,9 +2,14 @@ use crate::cloud_init::{self, CloudInitOptions};
 use crate::git;
 use crate::network;
 use crate::runtime::{self, LaunchConfig, LaunchMode};
-use crate::state::{self, ShareMount};
+use crate::state::{self, GuestEnvVar, ShareMount};
+use clap::error::ErrorKind;
+use clap::{ArgAction, ArgGroup, Args, CommandFactory, Parser, Subcommand};
+use petname::petname;
 use std::env;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse(env::args().skip(1).collect())?;
@@ -13,303 +18,217 @@ pub fn run() -> Result<(), String> {
         Command::Base(command) => base(command),
         Command::Launch(options) => launch(options),
         Command::Status(options) => status(options),
+        Command::Stop(options) => stop(options),
         Command::Doctor => doctor(),
         Command::List => list_instances(),
         Command::Destroy(options) => destroy(options),
-        Command::Help => {
-            print_usage();
+        Command::Help(text) => {
+            print!("{text}");
             Ok(())
         }
     }
 }
 
+#[derive(Debug)]
 enum Command {
     Base(BaseCommand),
     Launch(LaunchOptions),
     Status(TargetOptions),
+    Stop(TargetOptions),
     Doctor,
     List,
-    Destroy(TargetOptions),
-    Help,
+    Destroy(DestroyOptions),
+    Help(String),
 }
 
+#[derive(Clone, Debug, Subcommand)]
 enum BaseCommand {
     Import(BaseImportOptions),
     Capture(BaseCaptureOptions),
     List,
 }
 
+#[derive(Debug)]
 struct Cli {
     command: Command,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Args)]
 struct BaseImportOptions {
+    #[arg(long)]
     name: String,
+    #[arg(long)]
     image: PathBuf,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Args)]
+#[command(group(
+    ArgGroup::new("capture_target")
+        .required(true)
+        .args(["instance", "repo", "base"])
+))]
 struct BaseCaptureOptions {
+    #[arg(long)]
     name: String,
-    repo: String,
-    branch: String,
+    #[arg(long = "instance", conflicts_with_all = ["repo", "branch", "base"])]
+    instance: Option<String>,
+    #[arg(long, requires = "branch", conflicts_with = "base")]
+    repo: Option<String>,
+    #[arg(long, requires = "repo")]
+    branch: Option<String>,
+    #[arg(long, conflicts_with_all = ["instance", "repo", "branch"])]
+    base: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Args)]
+#[command(group(
+    ArgGroup::new("launch_selector")
+        .required(false)
+        .args(["name", "repo"])
+))]
 struct LaunchOptions {
-    repo: String,
-    branch: String,
+    #[arg(long, conflicts_with_all = ["repo", "branch"])]
+    name: Option<String>,
+    #[arg(long, conflicts_with = "name")]
+    repo: Option<String>,
+    #[arg(long, requires = "repo")]
+    branch: Option<String>,
+    #[arg(long, requires_all = ["repo", "branch"])]
     new_branch: bool,
+    #[arg(long, requires_all = ["repo", "branch"])]
     from: Option<String>,
+    #[arg(long)]
     base: Option<String>,
+    #[arg(long, hide = true)]
     vm: bool,
+    #[arg(long = "shell")]
     shell_only: bool,
+    #[arg(long = "no-enter")]
     no_enter: bool,
+    #[arg(long, default_value_t = runtime::default_cpus())]
     cpus: u8,
+    #[arg(long = "memory-mib", default_value_t = runtime::default_memory_mib())]
     memory_mib: u32,
+    #[arg(long = "no-cloud-init", action = ArgAction::SetFalse, default_value_t = true)]
     cloud_init: bool,
+    #[arg(long = "cloud-user", default_value_t = cloud_init::default_cloud_user())]
     cloud_user: String,
+    #[arg(long)]
     hostname: Option<String>,
+    #[arg(long = "ssh-pubkey")]
     ssh_pubkey: Option<PathBuf>,
+    #[arg(long = "ssh-private-key")]
     ssh_private_key: Option<PathBuf>,
+    #[arg(long = "init-script")]
     init_script: Option<PathBuf>,
-    shares: Option<Vec<ShareMount>>,
+    #[arg(long = "share", value_parser = state::parse_share)]
+    shares: Vec<ShareMount>,
+    #[arg(long = "with-codex")]
+    with_codex: bool,
+    #[arg(long = "with-claude")]
+    with_claude: bool,
+    #[arg(long = "with-gh")]
+    with_gh: bool,
+    #[arg(long = "with-ai")]
+    with_ai: bool,
+    #[arg(long)]
+    verbose: bool,
+    #[arg(long = "clear-shares")]
     clear_shares: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Args)]
+#[command(group(
+    ArgGroup::new("target")
+        .required(true)
+        .args(["name", "repo", "base"])
+))]
 struct TargetOptions {
-    repo: String,
-    branch: String,
+    #[arg(long, conflicts_with_all = ["repo", "branch", "base"])]
+    name: Option<String>,
+    #[arg(long, requires = "branch", conflicts_with = "base")]
+    repo: Option<String>,
+    #[arg(long, requires = "repo")]
+    branch: Option<String>,
+    #[arg(long, conflicts_with_all = ["name", "repo", "branch"])]
+    base: Option<String>,
+}
+
+#[derive(Clone, Debug, Args)]
+struct DestroyOptions {
+    #[command(flatten)]
+    target: TargetOptions,
+    #[arg(long = "yes", short = 'y')]
+    yes: bool,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "vibebox",
+    disable_help_subcommand = true,
+    args_conflicts_with_subcommands = true
+)]
+struct ClapCli {
+    #[command(subcommand)]
+    command: Option<ClapCommand>,
+    #[command(flatten)]
+    launch: LaunchOptions,
+}
+
+#[derive(Debug, Subcommand)]
+enum ClapCommand {
+    Base(ClapBaseCommand),
+    Launch(LaunchOptions),
+    Status(TargetOptions),
+    Stop(TargetOptions),
+    Doctor,
+    List,
+    Destroy(DestroyOptions),
+    Help,
+}
+
+#[derive(Debug, Args)]
+struct ClapBaseCommand {
+    #[command(subcommand)]
+    command: BaseCommand,
 }
 
 impl Cli {
     fn parse(args: Vec<String>) -> Result<Self, String> {
-        let Some((command, rest)) = args.split_first() else {
-            return Ok(Self {
-                command: Command::Help,
-            });
+        let parse_input = std::iter::once("vibebox".to_string())
+            .chain(args)
+            .collect::<Vec<_>>();
+        let cli = match ClapCli::try_parse_from(parse_input) {
+            Ok(cli) => cli,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+            {
+                return Ok(Self {
+                    command: Command::Help(err.to_string()),
+                });
+            }
+            Err(err) => return Err(err.to_string()),
         };
 
-        let command = match command.as_str() {
-            "base" => Command::Base(parse_base(rest)?),
-            "launch" => Command::Launch(parse_launch(rest)?),
-            "status" => Command::Status(parse_target(rest)?),
-            "doctor" => Command::Doctor,
-            "destroy" => Command::Destroy(parse_target(rest)?),
-            "list" => Command::List,
-            "help" | "--help" | "-h" => Command::Help,
-            other => return Err(format!("unknown command: {other}")),
+        let command = match cli.command {
+            Some(ClapCommand::Base(command)) => Command::Base(command.command),
+            Some(ClapCommand::Launch(options)) => {
+                Command::Launch(normalize_launch_options(options))
+            }
+            Some(ClapCommand::Status(options)) => Command::Status(options),
+            Some(ClapCommand::Stop(options)) => Command::Stop(options),
+            Some(ClapCommand::Doctor) => Command::Doctor,
+            Some(ClapCommand::List) => Command::List,
+            Some(ClapCommand::Destroy(options)) => Command::Destroy(options),
+            Some(ClapCommand::Help) => Command::Help(render_help()),
+            None => Command::Launch(normalize_launch_options(cli.launch)),
         };
 
         Ok(Self { command })
     }
-}
-
-fn parse_base(args: &[String]) -> Result<BaseCommand, String> {
-    let Some((subcommand, rest)) = args.split_first() else {
-        return Err("base requires a subcommand: import or list".to_string());
-    };
-
-    match subcommand.as_str() {
-        "import" => {
-            let mut name = None;
-            let mut image = None;
-            let mut index = 0;
-            while index < rest.len() {
-                match rest[index].as_str() {
-                    "--name" => {
-                        index += 1;
-                        name = Some(expect_value(rest, index, "--name")?);
-                    }
-                    "--image" => {
-                        index += 1;
-                        image = Some(PathBuf::from(expect_value(rest, index, "--image")?));
-                    }
-                    flag => return Err(format!("unknown flag for base import: {flag}")),
-                }
-                index += 1;
-            }
-
-            Ok(BaseCommand::Import(BaseImportOptions {
-                name: name.ok_or_else(|| "base import requires --name".to_string())?,
-                image: image.ok_or_else(|| "base import requires --image".to_string())?,
-            }))
-        }
-        "capture" => {
-            let mut name = None;
-            let mut repo = None;
-            let mut branch = None;
-            let mut index = 0;
-            while index < rest.len() {
-                match rest[index].as_str() {
-                    "--name" => {
-                        index += 1;
-                        name = Some(expect_value(rest, index, "--name")?);
-                    }
-                    "--repo" => {
-                        index += 1;
-                        repo = Some(expect_value(rest, index, "--repo")?);
-                    }
-                    "--branch" => {
-                        index += 1;
-                        branch = Some(expect_value(rest, index, "--branch")?);
-                    }
-                    flag => return Err(format!("unknown flag for base capture: {flag}")),
-                }
-                index += 1;
-            }
-
-            Ok(BaseCommand::Capture(BaseCaptureOptions {
-                name: name.ok_or_else(|| "base capture requires --name".to_string())?,
-                repo: repo.ok_or_else(|| "base capture requires --repo".to_string())?,
-                branch: branch.ok_or_else(|| "base capture requires --branch".to_string())?,
-            }))
-        }
-        "list" => Ok(BaseCommand::List),
-        other => Err(format!("unknown base subcommand: {other}")),
-    }
-}
-
-fn parse_launch(args: &[String]) -> Result<LaunchOptions, String> {
-    let mut repo = None;
-    let mut branch = None;
-    let mut new_branch = false;
-    let mut from = None;
-    let mut base = None;
-    let mut vm = false;
-    let mut shell_only = false;
-    let mut no_enter = false;
-    let mut cpus = runtime::default_cpus();
-    let mut memory_mib = runtime::default_memory_mib();
-    let mut cloud_init = true;
-    let mut cloud_user = cloud_init::default_cloud_user();
-    let mut hostname = None;
-    let mut ssh_pubkey = None;
-    let mut ssh_private_key = None;
-    let mut init_script = None;
-    let mut shares = Vec::new();
-    let mut saw_share = false;
-    let mut clear_shares = false;
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--repo" => {
-                index += 1;
-                repo = Some(expect_value(args, index, "--repo")?);
-            }
-            "--branch" => {
-                index += 1;
-                branch = Some(expect_value(args, index, "--branch")?);
-            }
-            "--new-branch" => new_branch = true,
-            "--from" => {
-                index += 1;
-                from = Some(expect_value(args, index, "--from")?);
-            }
-            "--base" => {
-                index += 1;
-                base = Some(expect_value(args, index, "--base")?);
-            }
-            "--vm" => vm = true,
-            "--shell" => shell_only = true,
-            "--no-enter" => no_enter = true,
-            "--no-cloud-init" => cloud_init = false,
-            "--cloud-user" => {
-                index += 1;
-                cloud_user = expect_value(args, index, "--cloud-user")?;
-            }
-            "--hostname" => {
-                index += 1;
-                hostname = Some(expect_value(args, index, "--hostname")?);
-            }
-            "--ssh-pubkey" => {
-                index += 1;
-                ssh_pubkey = Some(PathBuf::from(expect_value(args, index, "--ssh-pubkey")?));
-            }
-            "--ssh-private-key" => {
-                index += 1;
-                ssh_private_key = Some(PathBuf::from(expect_value(
-                    args,
-                    index,
-                    "--ssh-private-key",
-                )?));
-            }
-            "--init-script" => {
-                index += 1;
-                init_script = Some(PathBuf::from(expect_value(args, index, "--init-script")?));
-            }
-            "--share" => {
-                index += 1;
-                saw_share = true;
-                shares.push(state::parse_share(&expect_value(args, index, "--share")?)?);
-            }
-            "--clear-shares" => clear_shares = true,
-            "--cpus" => {
-                index += 1;
-                cpus = expect_value(args, index, "--cpus")?
-                    .parse::<u8>()
-                    .map_err(|_| "invalid value for --cpus".to_string())?;
-            }
-            "--memory-mib" => {
-                index += 1;
-                memory_mib = expect_value(args, index, "--memory-mib")?
-                    .parse::<u32>()
-                    .map_err(|_| "invalid value for --memory-mib".to_string())?;
-            }
-            flag => return Err(format!("unknown flag for launch: {flag}")),
-        }
-        index += 1;
-    }
-
-    Ok(LaunchOptions {
-        repo: repo.ok_or_else(|| "launch requires --repo".to_string())?,
-        branch: branch.ok_or_else(|| "launch requires --branch".to_string())?,
-        new_branch,
-        from,
-        base,
-        vm,
-        shell_only,
-        no_enter,
-        cpus,
-        memory_mib,
-        cloud_init,
-        cloud_user,
-        hostname,
-        ssh_pubkey,
-        ssh_private_key,
-        init_script,
-        shares: saw_share.then_some(shares),
-        clear_shares,
-    })
-}
-
-fn parse_target(args: &[String]) -> Result<TargetOptions, String> {
-    let mut repo = None;
-    let mut branch = None;
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--repo" => {
-                index += 1;
-                repo = Some(expect_value(args, index, "--repo")?);
-            }
-            "--branch" => {
-                index += 1;
-                branch = Some(expect_value(args, index, "--branch")?);
-            }
-            flag => return Err(format!("unknown flag: {flag}")),
-        }
-        index += 1;
-    }
-
-    Ok(TargetOptions {
-        repo: repo.ok_or_else(|| "command requires --repo".to_string())?,
-        branch: branch.ok_or_else(|| "command requires --branch".to_string())?,
-    })
 }
 
 fn base(command: BaseCommand) -> Result<(), String> {
@@ -322,11 +241,19 @@ fn base(command: BaseCommand) -> Result<(), String> {
             Ok(())
         }
         BaseCommand::Capture(options) => {
-            let instance = state::find_instance(&options.repo, &options.branch)?.ok_or_else(|| {
-                format!(
-                    "no instance found for {} {}",
-                    options.repo, options.branch
-                )
+            let instance = state::find_instance(
+                options.instance.as_deref(),
+                options.repo.as_deref(),
+                options.branch.as_deref(),
+                options.base.as_deref(),
+            )?
+            .ok_or_else(|| {
+                missing_instance_message(&TargetOptions {
+                    name: options.instance.clone(),
+                    repo: options.repo.clone(),
+                    branch: options.branch.clone(),
+                    base: options.base.clone(),
+                })
             })?;
             runtime::stop_instance_vm(&instance.instance_dir)?;
             let image = state::import_base_image(&options.name, &instance.rootfs_path)?;
@@ -356,26 +283,53 @@ fn base(command: BaseCommand) -> Result<(), String> {
 }
 
 fn launch(options: LaunchOptions) -> Result<(), String> {
+    let options = resolve_launch_selector(options)?;
+
     if options.vm && options.shell_only {
         return Err("--vm and --shell are mutually exclusive".to_string());
     }
-    if options.clear_shares && options.shares.is_some() {
-        return Err("--clear-shares and --share are mutually exclusive".to_string());
+    if options.clear_shares
+        && (!options.shares.is_empty()
+            || options.with_codex
+            || options.with_claude
+            || options.with_gh)
+    {
+        return Err(
+            "--clear-shares cannot be combined with --share, --with-codex, --with-claude, --with-gh, or --with-ai"
+                .to_string(),
+        );
     }
     if !options.cloud_init && options.init_script.is_some() {
         return Err("--init-script requires cloud-init; remove --no-cloud-init".to_string());
     }
 
     let plan = runtime::resolve_runtime(options.shell_only);
+    let resolved_base = if options.base.is_some() {
+        options.base.clone()
+    } else {
+        default_base_name()?
+    };
+    preflight_launch(&options, &plan, resolved_base.as_deref())?;
+
+    let generated_name = if options.name.is_none() && options.repo.is_none() {
+        Some(generate_instance_name()?)
+    } else {
+        None
+    };
+    let instance_name = options.name.as_deref().or(generated_name.as_deref());
+    let requested_shares = if options.clear_shares {
+        Some(Vec::new())
+    } else {
+        build_requested_shares(&options)?
+    };
+    let requested_guest_env = build_requested_guest_env(&options)?;
     let instance = state::ensure_instance(
-        &options.repo,
-        &options.branch,
-        options.base.as_deref(),
-        if options.clear_shares {
-            Some(&[])
-        } else {
-            options.shares.as_deref()
-        },
+        instance_name,
+        options.repo.as_deref(),
+        options.branch.as_deref(),
+        resolved_base.as_deref(),
+        requested_shares.as_deref(),
+        requested_guest_env.as_deref(),
     )?;
     let vmnet = match plan.mode {
         LaunchMode::Krunkit => Some(network::resolve_for_instance(&instance)?),
@@ -387,23 +341,29 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
             &CloudInitOptions {
                 enabled: options.cloud_init,
                 user: options.cloud_user.clone(),
-                hostname: options.hostname.clone(),
+                hostname: options
+                    .hostname
+                    .clone()
+                    .or_else(|| instance_name.map(str::to_string)),
                 ssh_pubkey: options.ssh_pubkey.clone(),
                 init_script: options.init_script.clone(),
                 shares: instance.shares.clone(),
                 network: vmnet.clone(),
+                verbose: options.verbose,
             },
         )?,
         LaunchMode::Shell => None,
     };
 
-    git::ensure_checkout(
-        &instance.checkout_dir,
-        &options.repo,
-        &options.branch,
-        options.new_branch,
-        options.from.as_deref(),
-    )?;
+    if let (Some(repo), Some(branch)) = (options.repo.as_deref(), options.branch.as_deref()) {
+        git::ensure_checkout(
+            &instance.checkout_dir,
+            repo,
+            branch,
+            options.new_branch,
+            options.from.as_deref(),
+        )?;
+    }
 
     let ssh_private_key_path = options
         .ssh_private_key
@@ -442,11 +402,15 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
             .as_ref()
             .and_then(|prepared| prepared.init_script_path.clone()),
         shares: instance.shares.clone(),
+        guest_env: instance.guest_env.clone(),
+        verbose: options.verbose,
         vmnet,
     };
 
-    for line in runtime::launch_summary(&instance, &launch_config) {
-        println!("{line}");
+    if options.verbose {
+        for line in runtime::launch_summary(&instance, &launch_config) {
+            println!("{line}");
+        }
     }
 
     if options.no_enter {
@@ -461,11 +425,24 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
 }
 
 fn status(options: TargetOptions) -> Result<(), String> {
-    let instance = state::find_instance(&options.repo, &options.branch)?
-        .ok_or_else(|| format!("no instance found for {} {}", options.repo, options.branch))?;
+    let instance = state::find_instance(
+        options.name.as_deref(),
+        options.repo.as_deref(),
+        options.branch.as_deref(),
+        options.base.as_deref(),
+    )?
+    .ok_or_else(|| missing_instance_message(&options))?;
     for line in instance.summary_lines() {
         println!("{line}");
     }
+    println!(
+        "runtime: {}",
+        if runtime::is_instance_vm_running(&instance.instance_dir)? {
+            "running"
+        } else {
+            "stopped"
+        }
+    );
     Ok(())
 }
 
@@ -477,9 +454,18 @@ fn list_instances() -> Result<(), String> {
     }
 
     for instance in instances {
+        let runtime_state = if runtime::is_instance_vm_running(&instance.instance_dir)? {
+            "running"
+        } else {
+            "stopped"
+        };
         println!(
-            "{}  {}  {}  {}",
-            instance.id, instance.repo, instance.branch, instance.base_image_name
+            "{}  {}  {}  {}  {}",
+            instance.id,
+            instance.repo.as_deref().unwrap_or("-"),
+            instance.branch.as_deref().unwrap_or("-"),
+            instance.base_image_name,
+            runtime_state
         );
     }
     Ok(())
@@ -537,11 +523,25 @@ fn doctor() -> Result<(), String> {
     Ok(())
 }
 
-fn destroy(options: TargetOptions) -> Result<(), String> {
-    if let Some(instance) = state::find_instance(&options.repo, &options.branch)? {
+fn destroy(options: DestroyOptions) -> Result<(), String> {
+    if let Some(instance) = state::find_instance(
+        options.target.name.as_deref(),
+        options.target.repo.as_deref(),
+        options.target.branch.as_deref(),
+        options.target.base.as_deref(),
+    )? {
+        if !options.yes && !confirm_destroy(&instance.id)? {
+            println!("aborted");
+            return Ok(());
+        }
         runtime::stop_instance_vm(&instance.instance_dir)?;
     }
-    let removed = state::destroy_instance(&options.repo, &options.branch)?;
+    let removed = state::destroy_instance(
+        options.target.name.as_deref(),
+        options.target.repo.as_deref(),
+        options.target.branch.as_deref(),
+        options.target.base.as_deref(),
+    )?;
     match removed {
         Some(path) => println!("removed {}", path.display()),
         None => println!("nothing to remove"),
@@ -549,31 +549,529 @@ fn destroy(options: TargetOptions) -> Result<(), String> {
     Ok(())
 }
 
-fn expect_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
+fn stop(options: TargetOptions) -> Result<(), String> {
+    let instance = state::find_instance(
+        options.name.as_deref(),
+        options.repo.as_deref(),
+        options.branch.as_deref(),
+        options.base.as_deref(),
+    )?
+    .ok_or_else(|| missing_instance_message(&options))?;
+    runtime::stop_instance_vm(&instance.instance_dir)?;
+    println!("stopped {}", instance.id);
+    Ok(())
 }
 
-fn print_usage() {
-    println!("vibebox");
-    println!();
-    println!("Commands:");
-    println!("  base import --name <base> --image <path>");
-    println!("  base capture --name <base> --repo <url> --branch <name>");
-    println!("  base list");
-    println!("  doctor");
-    println!(
-        "  launch --repo <url> --branch <name> [--base <base>] [--new-branch] [--from <base-branch>] [--shell] [--cpus <count>] [--memory-mib <size>] [--cloud-user <name>] [--hostname <name>] [--ssh-pubkey <path>] [--init-script <path>] [--share <host_path>:<guest_path>] [--clear-shares] [--no-cloud-init] [--no-enter]"
-    );
-    println!("  launch ... [--ssh-private-key <path>]");
-    println!("  status --repo <url> --branch <name>");
-    println!("  list");
-    println!("  destroy --repo <url> --branch <name>");
-    println!();
-    println!("Environment:");
-    println!("  VIBEBOX_HOME         override state directory");
-    println!("  VIBEBOX_ROOTFS_MIB   override default branch disk size in MiB");
-    println!("  VIBEBOX_SSH_READY_TIMEOUT_SECS  override SSH wait timeout for VM launch/reconnect");
-    println!("  VIBEBOX_VM_LAUNCHER  executable invoked for libkrun handoff");
+fn confirm_destroy(instance_id: &str) -> Result<bool, String> {
+    print!("Destroy instance {instance_id}? [y/N] ");
+    io::stdout().flush().map_err(|err| err.to_string())?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| err.to_string())?;
+    Ok(confirm_destroy_answer(&input))
+}
+
+fn confirm_destroy_answer(input: &str) -> bool {
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn resolve_launch_selector(mut options: LaunchOptions) -> Result<LaunchOptions, String> {
+    if options.repo.is_some() && options.branch.is_none() {
+        let repo = options.repo.as_deref().unwrap_or_default();
+        let branch = prompt_for_branch(repo)?;
+        options.branch = Some(branch);
+    }
+    Ok(options)
+}
+
+fn prompt_for_branch(repo: &str) -> Result<String, String> {
+    if !io::stdin().is_terminal() {
+        return Err(
+            "--repo was provided without --branch, but stdin is not interactive; pass --branch explicitly"
+                .to_string(),
+        );
+    }
+
+    let branches = git::list_recent_remote_branches(repo, 12)?;
+    if branches.is_empty() {
+        return Err(format!("no remote branches found for {repo}"));
+    }
+    if branches.len() == 1 {
+        return Ok(branches[0].clone());
+    }
+
+    eprintln!("Select a branch for {repo}:");
+    for (index, branch) in branches.iter().enumerate() {
+        eprintln!("  {}. {}", index + 1, branch);
+    }
+
+    loop {
+        eprint!("Branch [1-{}] (default 1): ", branches.len());
+        io::stderr().flush().map_err(|err| err.to_string())?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|err| err.to_string())?;
+        let selection = input.trim();
+        if selection.is_empty() {
+            return Ok(branches[0].clone());
+        }
+        if let Ok(index) = selection.parse::<usize>() {
+            if (1..=branches.len()).contains(&index) {
+                return Ok(branches[index - 1].clone());
+            }
+        }
+        eprintln!(
+            "Invalid selection. Enter a number from 1 to {}.",
+            branches.len()
+        );
+    }
+}
+
+fn missing_instance_message(options: &TargetOptions) -> String {
+    match (
+        options.name.as_deref(),
+        options.repo.as_deref(),
+        options.branch.as_deref(),
+        options.base.as_deref(),
+    ) {
+        (Some(name), _, _, _) => format!("no instance found for name {}", name),
+        (None, Some(repo), Some(branch), _) => format!("no instance found for {} {}", repo, branch),
+        (None, None, None, Some(base)) => format!("no base-only instance found for base {}", base),
+        _ => "no instance found".to_string(),
+    }
+}
+
+fn preflight_launch(
+    options: &LaunchOptions,
+    plan: &runtime::RuntimePlan,
+    resolved_base: Option<&str>,
+) -> Result<(), String> {
+    if resolved_base.is_none() {
+        return Err(missing_base_guidance());
+    }
+
+    if !options.shell_only && matches!(plan.mode, LaunchMode::Shell) {
+        return Err(missing_vm_runtime_guidance());
+    }
+
+    if !options.shell_only {
+        let ssh_pubkey = options
+            .ssh_pubkey
+            .clone()
+            .or_else(cloud_init::discover_ssh_public_key);
+        let ssh_private = options
+            .ssh_private_key
+            .clone()
+            .or_else(cloud_init::discover_ssh_private_key)
+            .or_else(|| {
+                ssh_pubkey
+                    .as_ref()
+                    .and_then(|path| cloud_init::private_key_from_public(path))
+            });
+
+        if ssh_pubkey.is_none() || ssh_private.is_none() {
+            return Err(missing_ssh_guidance());
+        }
+    }
+
+    Ok(())
+}
+
+fn missing_base_guidance() -> String {
+    [
+        "no base images are imported yet.",
+        "",
+        "Get a Linux guest image and import one first. Example:",
+        "  curl -LO https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img",
+        "  qemu-img convert -f qcow2 -O raw jammy-server-cloudimg-arm64.img ubuntu-jammy-arm64.raw",
+        "  vibebox base import --name ubuntu --image ./ubuntu-jammy-arm64.raw",
+        "",
+        "Then launch:",
+        "  vibebox --base ubuntu",
+        "",
+        "For a full environment check:",
+        "  vibebox doctor",
+    ]
+    .join("\n")
+}
+
+fn missing_vm_runtime_guidance() -> String {
+    let mut lines = vec![
+        "vibebox cannot launch a VM yet because the built-in runtime is not fully installed."
+            .to_string(),
+    ];
+    lines.push(String::new());
+
+    if !runtime::command_exists("krunkit") {
+        lines.push("Install krunkit:".to_string());
+        lines.push("  brew tap slp/krunkit".to_string());
+        lines.push("  brew install krunkit".to_string());
+        lines.push(String::new());
+    }
+
+    if network::find_vmnet_client().is_none() {
+        lines.push("Install vmnet-helper:".to_string());
+        lines.push(
+            "  curl -fsSL https://raw.githubusercontent.com/nirs/vmnet-helper/main/install.sh | sudo bash"
+                .to_string(),
+        );
+        lines.push(String::new());
+    }
+
+    lines.push("Then verify the machine is ready:".to_string());
+    lines.push("  vibebox doctor".to_string());
+    lines.push(String::new());
+    lines.push("If you only want a host shell instead of a VM:".to_string());
+    lines.push("  vibebox --shell".to_string());
+    lines.join("\n")
+}
+
+fn missing_ssh_guidance() -> String {
+    [
+        "vibebox needs an SSH keypair to log into the guest automatically.",
+        "",
+        "Create one if you do not already have it:",
+        "  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519",
+        "",
+        "Or pass explicit paths:",
+        "  vibebox --ssh-pubkey ~/.ssh/id_ed25519.pub --ssh-private-key ~/.ssh/id_ed25519",
+        "",
+        "For a full environment check:",
+        "  vibebox doctor",
+    ]
+    .join("\n")
+}
+
+fn normalize_launch_options(mut options: LaunchOptions) -> LaunchOptions {
+    if options.with_ai {
+        options.with_codex = true;
+        options.with_claude = true;
+    }
+    options
+}
+
+fn render_help() -> String {
+    let mut command = ClapCli::command();
+    let mut output = Vec::new();
+    command
+        .write_long_help(&mut output)
+        .expect("writing clap help should succeed");
+    String::from_utf8(output).expect("clap help should be valid UTF-8")
+}
+
+fn build_requested_shares(options: &LaunchOptions) -> Result<Option<Vec<ShareMount>>, String> {
+    let mut shares = options.shares.clone();
+    if options.with_codex {
+        shares.push(default_credential_share(".codex", &options.cloud_user)?);
+    }
+    if options.with_claude {
+        shares.push(default_credential_share(".claude", &options.cloud_user)?);
+    }
+    if options.with_gh {
+        if let Ok(share) = default_credential_share(".config/gh", &options.cloud_user) {
+            shares.push(share);
+        }
+    }
+
+    if shares.is_empty() {
+        return Ok(None);
+    }
+
+    shares.sort();
+    shares.dedup();
+    Ok(Some(shares))
+}
+
+fn build_requested_guest_env(options: &LaunchOptions) -> Result<Option<Vec<GuestEnvVar>>, String> {
+    let mut vars = Vec::new();
+
+    if let Some(name) = host_git_config("user.name")? {
+        vars.push(GuestEnvVar {
+            name: "GIT_AUTHOR_NAME".to_string(),
+            value: name.clone(),
+        });
+        vars.push(GuestEnvVar {
+            name: "GIT_COMMITTER_NAME".to_string(),
+            value: name,
+        });
+    }
+    if let Some(email) = host_git_config("user.email")? {
+        vars.push(GuestEnvVar {
+            name: "GIT_AUTHOR_EMAIL".to_string(),
+            value: email.clone(),
+        });
+        vars.push(GuestEnvVar {
+            name: "GIT_COMMITTER_EMAIL".to_string(),
+            value: email,
+        });
+    }
+
+    if options.with_claude {
+        if let Some(value) = env::var_os("ANTHROPIC_API_KEY") {
+            vars.push(GuestEnvVar {
+                name: "ANTHROPIC_API_KEY".to_string(),
+                value: value
+                    .into_string()
+                    .map_err(|_| "ANTHROPIC_API_KEY is not valid UTF-8".to_string())?,
+            });
+        }
+    }
+
+    if options.with_gh {
+        if let Some(token) = host_gh_auth_token()? {
+            vars.push(GuestEnvVar {
+                name: "GH_TOKEN".to_string(),
+                value: token,
+            });
+        }
+    }
+
+    if vars.is_empty() {
+        return Ok(None);
+    }
+
+    vars.sort_by(|left, right| left.name.cmp(&right.name));
+    vars.dedup_by(|left, right| left.name == right.name);
+    Ok(Some(vars))
+}
+
+fn host_git_config(key: &str) -> Result<Option<String>, String> {
+    let output = ProcessCommand::new("git")
+        .arg("config")
+        .arg("--global")
+        .arg("--get")
+        .arg(key)
+        .output()
+        .map_err(|err| format!("failed to query host git config {key}: {err}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| format!("host git config {key} is not valid UTF-8"))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn host_gh_auth_token() -> Result<Option<String>, String> {
+    let output = ProcessCommand::new("gh")
+        .arg("auth")
+        .arg("token")
+        .output()
+        .map_err(|err| err.to_string())?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let token = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn default_credential_share(dotdir: &str, cloud_user: &str) -> Result<ShareMount, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+    let host_path = PathBuf::from(home).join(dotdir);
+    let guest_path = PathBuf::from(format!("/home/{cloud_user}/{dotdir}"));
+    state::share_mount(&host_path, &guest_path).map_err(|err| {
+        format!(
+            "could not enable {} sharing from {} to {}: {err}",
+            dotdir,
+            host_path.display(),
+            guest_path.display()
+        )
+    })
+}
+
+fn default_base_name() -> Result<Option<String>, String> {
+    let images = state::list_base_images()?;
+    Ok(images
+        .into_iter()
+        .max_by_key(|image| image.created_unix)
+        .map(|image| image.name))
+}
+
+fn generate_instance_name() -> Result<String, String> {
+    let existing = state::list_instances()?
+        .into_iter()
+        .map(|instance| instance.id)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for _ in 0..256 {
+        let candidate = petname(2, "-")
+            .ok_or_else(|| "petname failed to generate an instance name".to_string())?;
+        if !existing.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err("could not generate a unique instance name; pass --name explicitly".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BaseCommand, Cli, Command, confirm_destroy_answer, missing_base_guidance,
+        missing_ssh_guidance, missing_vm_runtime_guidance,
+    };
+
+    #[test]
+    fn no_args_defaults_to_launch() {
+        let cli = Cli::parse(Vec::new()).expect("parse should succeed");
+        assert!(matches!(cli.command, Command::Launch(_)));
+    }
+
+    #[test]
+    fn top_level_flags_parse_as_launch() {
+        let cli = Cli::parse(vec![
+            "--base".to_string(),
+            "ubuntu".to_string(),
+            "--with-gh".to_string(),
+            "--share".to_string(),
+            "/tmp:/mnt/tmp".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Launch(options) => {
+                assert_eq!(options.base.as_deref(), Some("ubuntu"));
+                assert!(options.with_gh);
+                assert_eq!(options.shares.len(), 1);
+            }
+            _ => panic!("expected launch command"),
+        }
+    }
+
+    #[test]
+    fn explicit_stop_subcommand_parses() {
+        let cli = Cli::parse(vec![
+            "stop".to_string(),
+            "--name".to_string(),
+            "tools-box".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Stop(options) => {
+                assert_eq!(options.name.as_deref(), Some("tools-box"));
+            }
+            _ => panic!("expected stop command"),
+        }
+    }
+
+    #[test]
+    fn explicit_destroy_subcommand_parses_yes() {
+        let cli = Cli::parse(vec![
+            "destroy".to_string(),
+            "--name".to_string(),
+            "tools-box".to_string(),
+            "--yes".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Destroy(options) => {
+                assert_eq!(options.target.name.as_deref(), Some("tools-box"));
+                assert!(options.yes);
+            }
+            _ => panic!("expected destroy command"),
+        }
+    }
+
+    #[test]
+    fn explicit_base_capture_subcommand_parses() {
+        let cli = Cli::parse(vec![
+            "base".to_string(),
+            "capture".to_string(),
+            "--name".to_string(),
+            "ubuntu-dev".to_string(),
+            "--instance".to_string(),
+            "tools-box".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Base(BaseCommand::Capture(options)) => {
+                assert_eq!(options.name, "ubuntu-dev");
+                assert_eq!(options.instance.as_deref(), Some("tools-box"));
+            }
+            _ => panic!("expected base capture command"),
+        }
+    }
+
+    #[test]
+    fn status_still_enforces_repo_branch_pairing() {
+        let err = Cli::parse(vec![
+            "status".to_string(),
+            "--repo".to_string(),
+            "git@github.com:org/repo.git".to_string(),
+        ])
+        .expect_err("parse should fail");
+        assert!(err.contains("--repo <REPO>"));
+        assert!(err.contains("--branch <BRANCH>"));
+    }
+
+    #[test]
+    fn status_requires_a_target_selector() {
+        let err = Cli::parse(vec!["status".to_string()]).expect_err("parse should fail");
+        assert!(err.contains("required arguments were not provided"));
+    }
+
+    #[test]
+    fn launch_accepts_repo_without_branch_for_interactive_selection() {
+        let cli = Cli::parse(vec![
+            "--repo".to_string(),
+            "git@github.com:org/repo.git".to_string(),
+        ])
+        .expect("parse should succeed");
+        match cli.command {
+            Command::Launch(options) => {
+                assert_eq!(options.repo.as_deref(), Some("git@github.com:org/repo.git"));
+                assert!(options.branch.is_none());
+            }
+            _ => panic!("expected launch command"),
+        }
+    }
+
+    #[test]
+    fn missing_base_guidance_includes_import_example() {
+        let guidance = missing_base_guidance();
+        assert!(guidance.contains("vibebox base import --name ubuntu"));
+        assert!(guidance.contains("vibebox --base ubuntu"));
+    }
+
+    #[test]
+    fn missing_ssh_guidance_includes_keygen_example() {
+        let guidance = missing_ssh_guidance();
+        assert!(guidance.contains("ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519"));
+        assert!(guidance.contains("vibebox doctor"));
+    }
+
+    #[test]
+    fn missing_vm_runtime_guidance_includes_doctor_hint() {
+        let guidance = missing_vm_runtime_guidance();
+        assert!(guidance.contains("vibebox doctor"));
+    }
+
+    #[test]
+    fn destroy_confirmation_accepts_yes_forms() {
+        assert!(confirm_destroy_answer("y"));
+        assert!(confirm_destroy_answer("yes"));
+        assert!(!confirm_destroy_answer(""));
+        assert!(!confirm_destroy_answer("n"));
+    }
 }

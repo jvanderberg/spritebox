@@ -3,10 +3,13 @@ use crate::state::{Instance, ShareMount};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const DEFAULT_CLOUD_USER: &str = "vibe";
 const SSH_KEY_BASENAMES: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
+const GUEST_MOUNT_ROOT: &str = "/var/lib/vibebox/mounts";
+const GUEST_WORKSPACE_PATH: &str = "/workspace";
+const DEFAULT_NOFILE_LIMIT: u64 = 65_536;
 
 pub struct CloudInitOptions {
     pub enabled: bool,
@@ -16,6 +19,7 @@ pub struct CloudInitOptions {
     pub init_script: Option<PathBuf>,
     pub shares: Vec<ShareMount>,
     pub network: Option<VmnetConfig>,
+    pub verbose: bool,
 }
 
 pub struct PreparedCloudInit {
@@ -127,7 +131,13 @@ pub fn prepare(
     let files_dir = cloud_init_dir.join("files");
     fs::create_dir_all(&files_dir).map_err(|err| err.to_string())?;
 
-    let user_data = render_user_data(&options.user, &ssh_pubkey, &hostname, host_uid, &options.shares);
+    let user_data = render_user_data(
+        &options.user,
+        &ssh_pubkey,
+        &hostname,
+        host_uid,
+        &options.shares,
+    );
     let init_script_path = match &options.init_script {
         Some(path) => {
             if !path.is_file() {
@@ -168,7 +178,7 @@ pub fn prepare(
     if image_path.exists() {
         fs::remove_file(&image_path).map_err(|err| err.to_string())?;
     }
-    create_seed_image(&files_dir, &image_path)?;
+    create_seed_image(&files_dir, &image_path, options.verbose)?;
 
     Ok(Some(PreparedCloudInit {
         image_path,
@@ -179,9 +189,10 @@ pub fn prepare(
     }))
 }
 
-fn create_seed_image(source_dir: &Path, image_path: &Path) -> Result<(), String> {
+fn create_seed_image(source_dir: &Path, image_path: &Path, verbose: bool) -> Result<(), String> {
     if command_exists("hdiutil") {
-        let status = Command::new("hdiutil")
+        let mut command = Command::new("hdiutil");
+        command
             .arg("makehybrid")
             .arg("-iso")
             .arg("-joliet")
@@ -189,9 +200,9 @@ fn create_seed_image(source_dir: &Path, image_path: &Path) -> Result<(), String>
             .arg("CIDATA")
             .arg("-o")
             .arg(image_path)
-            .arg(source_dir)
-            .status()
-            .map_err(|err| err.to_string())?;
+            .arg(source_dir);
+        quiet_command(&mut command, verbose);
+        let status = command.status().map_err(|err| err.to_string())?;
         if status.success() {
             return Ok(());
         }
@@ -199,16 +210,17 @@ fn create_seed_image(source_dir: &Path, image_path: &Path) -> Result<(), String>
     }
 
     if command_exists("genisoimage") {
-        let status = Command::new("genisoimage")
+        let mut command = Command::new("genisoimage");
+        command
             .arg("-output")
             .arg(image_path)
             .arg("-volid")
             .arg("CIDATA")
             .arg("-joliet")
             .arg("-rock")
-            .arg(source_dir)
-            .status()
-            .map_err(|err| err.to_string())?;
+            .arg(source_dir);
+        quiet_command(&mut command, verbose);
+        let status = command.status().map_err(|err| err.to_string())?;
         if status.success() {
             return Ok(());
         }
@@ -216,16 +228,17 @@ fn create_seed_image(source_dir: &Path, image_path: &Path) -> Result<(), String>
     }
 
     if command_exists("mkisofs") {
-        let status = Command::new("mkisofs")
+        let mut command = Command::new("mkisofs");
+        command
             .arg("-output")
             .arg(image_path)
             .arg("-volid")
             .arg("CIDATA")
             .arg("-joliet")
             .arg("-rock")
-            .arg(source_dir)
-            .status()
-            .map_err(|err| err.to_string())?;
+            .arg(source_dir);
+        quiet_command(&mut command, verbose);
+        let status = command.status().map_err(|err| err.to_string())?;
         if status.success() {
             return Ok(());
         }
@@ -235,9 +248,20 @@ fn create_seed_image(source_dir: &Path, image_path: &Path) -> Result<(), String>
     Err("no ISO creator found; install hdiutil, genisoimage, or mkisofs".to_string())
 }
 
+fn quiet_command(command: &mut Command, verbose: bool) {
+    if !verbose {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+}
+
 fn default_hostname(instance: &Instance) -> String {
-    let repo_name = repo_basename(&instance.repo);
-    sanitize_hostname(&format!("{repo_name}-{}", instance.branch))
+    match (&instance.repo, &instance.branch) {
+        (Some(repo), Some(branch)) => {
+            let repo_name = repo_basename(repo);
+            sanitize_hostname(&format!("{repo_name}-{branch}"))
+        }
+        _ => sanitize_hostname(&instance.base_image_name),
+    }
 }
 
 fn repo_basename(repo: &str) -> String {
@@ -296,8 +320,9 @@ fn render_user_data(
     let mounts = render_mounts(shares);
     let bootcmd = render_bootcmd(shares);
     let runcmd = render_runcmd(user, shares, false);
+    let write_files = render_common_write_files(user);
     format!(
-        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n"
+        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nwrite_files:\n{write_files}\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n"
     )
 }
 
@@ -323,34 +348,42 @@ fi
     let mounts = render_mounts(shares);
     let bootcmd = render_bootcmd(shares);
     let runcmd = render_runcmd(user, shares, true);
+    let common_write_files = render_common_write_files(user);
 
     format!(
-        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nwrite_files:\n  - path: /var/lib/vibebox/init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{init_script_content}\n  - path: /var/lib/vibebox/run-init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{run_init_script_content}\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n",
+        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nwrite_files:\n{common_write_files}\n  - path: /var/lib/vibebox/init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{init_script_content}\n  - path: /var/lib/vibebox/run-init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{run_init_script_content}\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n",
         init_script_content = indent_for_yaml(init_script, 6),
         run_init_script_content = indent_for_yaml(run_init_script, 6),
     )
 }
 
 fn render_mounts(shares: &[ShareMount]) -> String {
-    let mut lines = vec!["  - [ workspace, /workspace, virtiofs, \"defaults,nofail\", \"0\", \"0\" ]".to_string()];
-    for (index, share) in shares.iter().enumerate() {
+    let mut lines = vec![format!(
+        "  - [ workspace, \"{}\", virtiofs, \"defaults,nofail\", \"0\", \"0\" ]",
+        yaml_escape(workspace_backing_mount_path())
+    )];
+    for index in 0..shares.len() {
         lines.push(format!(
             "  - [ {}, \"{}\", virtiofs, \"defaults,nofail\", \"0\", \"0\" ]",
             share_tag(index),
-            yaml_escape(&share.guest_path.display().to_string())
+            yaml_escape(&share_backing_mount_path(index))
         ));
     }
     lines.join("\n")
 }
 
 fn render_bootcmd(shares: &[ShareMount]) -> String {
-    let mut lines = vec![
-        "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace\" ]".to_string(),
-    ];
-    for share in shares {
-        let path = shell_quote(&share.guest_path.display().to_string());
+    let mut lines = vec![format!(
+        "  - [ sh, -lc, \"{}\" ]",
+        prepare_dir_command(workspace_backing_mount_path(), GUEST_WORKSPACE_PATH)
+    )];
+    for (index, share) in shares.iter().enumerate() {
         lines.push(format!(
-            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}\" ]"
+            "  - [ sh, -lc, \"{}\" ]",
+            prepare_dir_command(
+                &share_backing_mount_path(index),
+                &share.guest_path.display().to_string()
+            )
         ));
     }
     lines.join("\n")
@@ -360,12 +393,18 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
     let mut lines = vec![
         "  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon; fi\" ]".to_string(),
         "  - [ systemctl, enable, --now, avahi-daemon ]".to_string(),
-        "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]".to_string(),
+        format!(
+            "  - [ sh, -lc, \"{}\" ]",
+            bind_mount_command(workspace_backing_mount_path(), GUEST_WORKSPACE_PATH)
+        ),
     ];
-    for share in shares {
-        let path = shell_quote(&share.guest_path.display().to_string());
+    for (index, share) in shares.iter().enumerate() {
         lines.push(format!(
-            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}; mountpoint -q {path} || mount {path} || true\" ]"
+            "  - [ sh, -lc, \"{}\" ]",
+            bind_mount_command(
+                &share_backing_mount_path(index),
+                &share.guest_path.display().to_string()
+            )
         ));
     }
     if includes_init_script {
@@ -376,8 +415,50 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
             "  - [ su, -, {user}, -c, /var/lib/vibebox/run-init.sh ]"
         ));
     }
-    lines.push(format!("  - [ ln, -sfn, /workspace, /home/{user}/workspace ]"));
+    lines.push(format!(
+        "  - [ ln, -sfn, {}, /home/{user}/workspace ]",
+        GUEST_WORKSPACE_PATH
+    ));
     lines.join("\n")
+}
+
+fn workspace_backing_mount_path() -> &'static str {
+    "/var/lib/vibebox/mounts/workspace"
+}
+
+fn share_backing_mount_path(index: usize) -> String {
+    format!("{GUEST_MOUNT_ROOT}/{}", share_tag(index))
+}
+
+fn prepare_dir_command(backing_path: &str, guest_path: &str) -> String {
+    let backing = shell_quote(backing_path);
+    let guest = shell_quote(guest_path);
+    format!(
+        "if [ -e {backing} ] && [ ! -d {backing} ]; then rm -f {backing}; fi; mkdir -p {backing}; if [ -e {guest} ] && [ ! -d {guest} ]; then rm -f {guest}; fi; mkdir -p {guest}"
+    )
+}
+
+fn bind_mount_command(backing_path: &str, guest_path: &str) -> String {
+    let backing = shell_quote(backing_path);
+    let guest = shell_quote(guest_path);
+    format!(
+        "{}; if mountpoint -q {guest} && [ \"$(findmnt -n -o FSTYPE {guest} 2>/dev/null || true)\" = \"virtiofs\" ]; then umount {guest} || true; fi; mountpoint -q {backing} || mount {backing} || true; mountpoint -q {guest} || mount --bind {backing} {guest} || true; mount --make-private {guest} >/dev/null 2>&1 || true",
+        prepare_dir_command(backing_path, guest_path)
+    )
+}
+
+fn render_common_write_files(user: &str) -> String {
+    format!(
+        "  - path: /etc/security/limits.d/99-vibebox.conf\n    permissions: '0644'\n    owner: root:root\n    content: |\n{}\n",
+        indent_for_yaml(&render_nofile_limits(user), 6)
+    )
+}
+
+fn render_nofile_limits(user: &str) -> String {
+    format!(
+        "* soft nofile {limit}\n* hard nofile {limit}\nroot soft nofile {limit}\nroot hard nofile {limit}\n{user} soft nofile {limit}\n{user} hard nofile {limit}\n",
+        limit = DEFAULT_NOFILE_LIMIT
+    )
 }
 
 fn share_tag(index: usize) -> String {
@@ -409,7 +490,11 @@ fn detect_host_uid() -> Option<u32> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout).ok()?.trim().parse::<u32>().ok()
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 fn render_meta_data(instance_id: &str, hostname: &str) -> String {
@@ -453,7 +538,8 @@ mod tests {
 
     #[test]
     fn user_data_contains_user_and_key() {
-        let rendered = render_user_data("vibe", "ssh-ed25519 AAAATEST", "repo-main", Some(501), &[]);
+        let rendered =
+            render_user_data("vibe", "ssh-ed25519 AAAATEST", "repo-main", Some(501), &[]);
         assert!(rendered.contains("preserve_hostname: false"));
         assert!(rendered.contains("hostname: repo-main"));
         assert!(rendered.contains("growpart:"));
@@ -461,10 +547,13 @@ mod tests {
         assert!(rendered.contains("name: vibe"));
         assert!(rendered.contains("uid: 501"));
         assert!(rendered.contains("ssh-ed25519 AAAATEST"));
-        assert!(rendered.contains("rm -f /workspace"));
+        assert!(rendered.contains("mkdir -p '/var/lib/vibebox/mounts/workspace'"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
-        assert!(rendered.contains("workspace, /workspace, virtiofs"));
+        assert!(rendered.contains("path: /etc/security/limits.d/99-vibebox.conf"));
+        assert!(rendered.contains("* soft nofile 65536"));
+        assert!(rendered.contains("workspace, \"/var/lib/vibebox/mounts/workspace\", virtiofs"));
+        assert!(rendered.contains("mount --bind '/var/lib/vibebox/mounts/workspace' '/workspace'"));
         assert!(rendered.contains("ln, -sfn, /workspace, /home/vibe/workspace"));
     }
 
@@ -496,7 +585,9 @@ mod tests {
         assert!(rendered.contains("sudo touch /var/lib/vibebox/init.done"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
-        assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
+        assert!(rendered.contains("path: /etc/security/limits.d/99-vibebox.conf"));
+        assert!(rendered.contains("[ share0, \"/var/lib/vibebox/mounts/share0\", virtiofs"));
+        assert!(rendered.contains("mount --bind '/var/lib/vibebox/mounts/share0' '/mnt/share'"));
     }
 
     #[test]
@@ -521,8 +612,8 @@ mod tests {
     fn default_hostname_uses_repo_and_branch() {
         let instance = Instance {
             id: "ignored-instance-id".to_string(),
-            repo: "git@github.com:jvanderberg/kicad_jlcimport.git".to_string(),
-            branch: "main".to_string(),
+            repo: Some("git@github.com:jvanderberg/kicad_jlcimport.git".to_string()),
+            branch: Some("main".to_string()),
             instance_dir: PathBuf::from("/tmp/instance"),
             base_image_id: "ubuntu".to_string(),
             base_image_name: "ubuntu".to_string(),
@@ -536,10 +627,37 @@ mod tests {
                 guest: 22,
             }],
             shares: Vec::new(),
+            guest_env: Vec::new(),
             created_unix: 0,
         };
 
         assert_eq!(default_hostname(&instance), "kicad-jlcimport-main");
+    }
+
+    #[test]
+    fn default_hostname_uses_base_name_for_base_only_instances() {
+        let instance = Instance {
+            id: "ignored-instance-id".to_string(),
+            repo: None,
+            branch: None,
+            instance_dir: PathBuf::from("/tmp/instance"),
+            base_image_id: "ubuntu".to_string(),
+            base_image_name: "ubuntu".to_string(),
+            base_image_path: PathBuf::from("/tmp/base.img"),
+            checkout_dir: PathBuf::from("/tmp/checkout"),
+            rootfs_path: PathBuf::from("/tmp/branch.img"),
+            rootfs_mb: 1024,
+            host_port_base: 28000,
+            ports: vec![PortMapping {
+                host: 28000,
+                guest: 22,
+            }],
+            shares: Vec::new(),
+            guest_env: Vec::new(),
+            created_unix: 0,
+        };
+
+        assert_eq!(default_hostname(&instance), "ubuntu");
     }
 
     #[test]

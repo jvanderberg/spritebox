@@ -1,19 +1,39 @@
 use crate::network::VmnetConfig;
 use crate::ports::PortMapping;
-use crate::state::{Instance, ShareMount};
+use crate::state::{GuestEnvVar, Instance, ShareMount};
+use crossterm::cursor::{Hide, MoveTo, Show, position};
+use crossterm::execute;
+use crossterm::terminal::{Clear as TermClear, ClearType};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{io::Error as IoError, os::unix::process::CommandExt};
 
 const DEFAULT_CPUS: u8 = 4;
 const DEFAULT_MEMORY_MIB: u32 = 8192;
 const DEFAULT_WORKSPACE_TAG: &str = "workspace";
 const DEFAULT_SSH_READY_TIMEOUT_SECS: u64 = 300;
+const QUIET_LOADING_FRAME_MILLIS: u64 = 16;
+const SSH_PROBE_INTERVAL_MILLIS: u64 = 1000;
+const GUEST_MOUNT_ROOT: &str = "/var/lib/vibebox/mounts";
+const GUEST_WORKSPACE_PATH: &str = "/workspace";
+const GUEST_NOFILE_LIMIT: u64 = 65_536;
+const HOST_NOFILE_LIMIT: u64 = 65_536;
 
 pub enum LaunchMode {
     External(PathBuf),
@@ -36,6 +56,8 @@ pub struct LaunchConfig {
     pub ssh_private_key_path: Option<PathBuf>,
     pub init_script_path: Option<PathBuf>,
     pub shares: Vec<ShareMount>,
+    pub guest_env: Vec<GuestEnvVar>,
+    pub verbose: bool,
     pub vmnet: Option<VmnetConfig>,
 }
 
@@ -58,6 +80,10 @@ pub fn stop_instance_vm(instance_dir: &Path) -> Result<(), String> {
         terminate_pid(pid)?;
     }
     stop_stale_vm(&instance_dir.join("runtime").join("krunkit.pid"))
+}
+
+pub fn is_instance_vm_running(instance_dir: &Path) -> Result<bool, String> {
+    instance_has_running_vm(instance_dir)
 }
 
 pub fn resolve_runtime(force_shell: bool) -> RuntimePlan {
@@ -138,7 +164,7 @@ pub fn launch_summary(instance: &Instance, config: &LaunchConfig) -> Vec<String>
     } else if command_exists("krunkit") {
         if config.vmnet.is_some() {
             lines.push("vm_launcher: builtin krunkit via vmnet-client".to_string());
-            lines.push("network: SSH + local port forwards".to_string());
+            lines.push("network: guest IP + .local mDNS hostname".to_string());
         } else {
             lines.push("vm_launcher: builtin krunkit without host networking".to_string());
         }
@@ -170,8 +196,16 @@ fn launch_shell(instance: &Instance) -> Result<i32, String> {
         .env("VIBEBOX_BASE_IMAGE", &instance.base_image_path)
         .env("VIBEBOX_BASE_IMAGE_ID", &instance.base_image_id)
         .env("VIBEBOX_ROOTFS", &instance.rootfs_path)
-        .env("VIBEBOX_BRANCH", &instance.branch)
+        .env("VIBEBOX_REPO", instance.repo.as_deref().unwrap_or_default())
+        .env(
+            "VIBEBOX_BRANCH",
+            instance.branch.as_deref().unwrap_or_default(),
+        )
         .env("VIBEBOX_SHARES", encode_env_shares(&instance.shares))
+        .env(
+            "VIBEBOX_GUEST_ENV",
+            encode_guest_env_names(&instance.guest_env),
+        )
         .env("VIBEBOX_PORTS", encode_env_ports(&instance.ports))
         .status()
         .map_err(|err| err.to_string())?;
@@ -187,8 +221,11 @@ fn launch_external(
     command
         .current_dir(&instance.checkout_dir)
         .env("VIBEBOX_INSTANCE", &instance.id)
-        .env("VIBEBOX_REPO", &instance.repo)
-        .env("VIBEBOX_BRANCH", &instance.branch)
+        .env("VIBEBOX_REPO", instance.repo.as_deref().unwrap_or_default())
+        .env(
+            "VIBEBOX_BRANCH",
+            instance.branch.as_deref().unwrap_or_default(),
+        )
         .env("VIBEBOX_CHECKOUT", &instance.checkout_dir)
         .env("VIBEBOX_BASE_IMAGE", &instance.base_image_path)
         .env("VIBEBOX_BASE_IMAGE_ID", &instance.base_image_id)
@@ -213,6 +250,10 @@ fn launch_external(
             config.hostname.as_deref().unwrap_or_default(),
         )
         .env("VIBEBOX_SHARES", encode_env_shares(&config.shares))
+        .env(
+            "VIBEBOX_GUEST_ENV",
+            encode_guest_env_names(&config.guest_env),
+        )
         .env("VIBEBOX_PORTS", encode_env_ports(&instance.ports));
 
     if let Some(vmnet) = &config.vmnet {
@@ -256,13 +297,16 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
 
     if instance_has_running_vm(&instance.instance_dir)? {
         if running_vm_matches_shares(&shares_path, &config.shares)? {
-            eprintln!("reconnecting to running vm for {}", instance.id);
+            if config.verbose {
+                eprintln!("reconnecting to running vm for {}", instance.id);
+            }
             if wait_for_running_vm_ssh(
                 &instance.instance_dir,
                 ssh_user,
                 ssh_private_key,
                 &known_hosts,
                 vmnet,
+                config.verbose,
             )? {
                 return connect_ssh(
                     instance,
@@ -271,15 +315,24 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
                     &known_hosts,
                     vmnet,
                     &config.shares,
+                    &config.guest_env,
+                    config.verbose,
                 );
             }
 
-            eprintln!(
-                "running vm for {} did not accept ssh within timeout, restarting it",
-                instance.id
-            );
+            if config.verbose {
+                eprintln!(
+                    "running vm for {} did not accept ssh within timeout, restarting it",
+                    instance.id
+                );
+            }
         } else {
-            eprintln!("share configuration changed for {}, restarting vm", instance.id);
+            if config.verbose {
+                eprintln!(
+                    "share configuration changed for {}, restarting vm",
+                    instance.id
+                );
+            }
         }
     }
 
@@ -352,6 +405,7 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
+    apply_child_nofile_limit(&mut command, HOST_NOFILE_LIMIT)?;
 
     let mut child = command.spawn().map_err(|err| err.to_string())?;
     let ssh_ready = wait_for_ssh(
@@ -361,6 +415,7 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         &known_hosts,
         vmnet,
         &krunkit_log,
+        config.verbose,
     )?;
     if !ssh_ready {
         stop_child(&mut child)?;
@@ -379,6 +434,8 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         &known_hosts,
         vmnet,
         &config.shares,
+        &config.guest_env,
+        config.verbose,
     )
 }
 
@@ -389,9 +446,11 @@ fn wait_for_ssh(
     known_hosts: &Path,
     vmnet: &VmnetConfig,
     krunkit_log: &Path,
+    verbose: bool,
 ) -> Result<bool, String> {
     let start = Instant::now();
-    let mut progress = SshWaitProgress::new(&vmnet.guest_ip);
+    let mut progress = LaunchProgress::new(&vmnet.guest_ip, verbose);
+    let mut last_probe = None;
     while start.elapsed() < ssh_ready_timeout() {
         progress.tick(start.elapsed())?;
         if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
@@ -407,12 +466,15 @@ fn wait_for_ssh(
             return Err(error);
         }
 
-        if probe_ssh(ssh_user, ssh_private_key, known_hosts, vmnet)? {
-            progress.finish()?;
-            return Ok(true);
+        if should_probe_ssh(start.elapsed(), last_probe) {
+            last_probe = Some(start.elapsed());
+            if probe_ssh(ssh_user, ssh_private_key, known_hosts, vmnet)? {
+                progress.finish()?;
+                return Ok(true);
+            }
         }
 
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(QUIET_LOADING_FRAME_MILLIS));
     }
 
     progress.finish()?;
@@ -425,14 +487,19 @@ fn wait_for_running_vm_ssh(
     ssh_private_key: &Path,
     known_hosts: &Path,
     vmnet: &VmnetConfig,
+    verbose: bool,
 ) -> Result<bool, String> {
     let start = Instant::now();
-    let mut progress = SshWaitProgress::new(&vmnet.guest_ip);
+    let mut progress = LaunchProgress::new(&vmnet.guest_ip, verbose);
+    let mut last_probe = None;
     while start.elapsed() < ssh_ready_timeout() {
         progress.tick(start.elapsed())?;
-        if probe_ssh(ssh_user, ssh_private_key, known_hosts, vmnet)? {
-            progress.finish()?;
-            return Ok(true);
+        if should_probe_ssh(start.elapsed(), last_probe) {
+            last_probe = Some(start.elapsed());
+            if probe_ssh(ssh_user, ssh_private_key, known_hosts, vmnet)? {
+                progress.finish()?;
+                return Ok(true);
+            }
         }
 
         if !instance_has_running_vm(instance_dir)? {
@@ -440,7 +507,7 @@ fn wait_for_running_vm_ssh(
             return Ok(false);
         }
 
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(QUIET_LOADING_FRAME_MILLIS));
     }
 
     progress.finish()?;
@@ -464,23 +531,20 @@ fn detect_runtime_failure(krunkit_log: &Path) -> Result<Option<String>, String> 
 }
 
 fn connect_ssh(
-    instance: &Instance,
+    _instance: &Instance,
     ssh_user: &str,
     ssh_private_key: &Path,
     known_hosts: &Path,
     vmnet: &VmnetConfig,
     shares: &[ShareMount],
+    guest_env: &[GuestEnvVar],
+    verbose: bool,
 ) -> Result<i32, String> {
-    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet);
-    for mapping in &instance.ports {
-        command
-            .arg("-L")
-            .arg(format!("{}:127.0.0.1:{}", mapping.host, mapping.guest));
-    }
+    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, true);
     command
         .arg("-tt")
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
-        .arg(guest_shell_command(shares));
+        .arg(guest_shell_command(shares, guest_env, verbose));
 
     let status = command.status().map_err(|err| err.to_string())?;
     Ok(status.code().unwrap_or_default())
@@ -490,19 +554,106 @@ fn krunkit_network_device(mac_address: &str) -> String {
     format!("virtio-net,type=unixgram,fd=4,mac={mac_address}")
 }
 
-fn guest_shell_command(shares: &[ShareMount]) -> String {
-    let mut share_mounts = String::new();
-    for (index, share) in shares.iter().enumerate() {
-        let path = shell_quote(&share.guest_path.display().to_string());
-        share_mounts.push_str(&format!(
-            " if [ -e {path} ] && [ ! -d {path} ]; then sudo rm -f {path}; fi; sudo mkdir -p {path}; if ! mountpoint -q {path}; then sudo mount -t virtiofs {} {path} >/dev/null 2>&1 || true; fi;",
-            share_tag(index)
-        ));
+#[cfg(unix)]
+fn apply_child_nofile_limit(command: &mut Command, limit: u64) -> Result<(), String> {
+    let limit =
+        libc::rlim_t::try_from(limit).map_err(|_| format!("invalid nofile limit {limit}"))?;
+    unsafe {
+        command.pre_exec(move || set_current_process_nofile_limit(limit));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_child_nofile_limit(_command: &mut Command, _limit: u64) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_current_process_nofile_limit(limit: libc::rlim_t) -> Result<(), IoError> {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let get_result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) };
+    if get_result != 0 {
+        return Err(IoError::last_os_error());
     }
 
+    let desired_soft = limit.min(current.rlim_max);
+    let desired_hard = current.rlim_max.max(limit);
+    let updated = libc::rlimit {
+        rlim_cur: desired_soft,
+        rlim_max: desired_hard,
+    };
+    let set_result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &updated) };
+    if set_result != 0 {
+        return Err(IoError::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn workspace_backing_mount_path() -> &'static str {
+    "/var/lib/vibebox/mounts/workspace"
+}
+
+fn share_backing_mount_path(index: usize) -> String {
+    format!("{GUEST_MOUNT_ROOT}/{}", share_tag(index))
+}
+
+fn bind_mount_command(backing_path: &str, guest_path: &str, mount_command: &str) -> String {
+    let backing = shell_quote(backing_path);
+    let guest = shell_quote(guest_path);
     format!(
-        "bash -lc 'if command -v cloud-init >/dev/null 2>&1; then CLOUD_INIT_STATUS=\"$(sudo cloud-init status 2>/dev/null || true)\"; if ! printf \"%s\" \"$CLOUD_INIT_STATUS\" | grep -q \"status: done\"; then echo \"waiting for cloud-init/bootstrap...\"; if sudo test -e /var/log/vibebox-init.log; then sudo sh -lc \"tail -n +1 -F /var/log/vibebox-init.log\" & TAIL_PID=$!; fi; sudo cloud-init status --wait >/dev/null 2>&1 || true; if [ -n \"${{TAIL_PID:-}}\" ]; then kill \"$TAIL_PID\" 2>/dev/null || true; wait \"$TAIL_PID\" 2>/dev/null || true; fi; echo \"cloud-init/bootstrap complete\"; fi; if sudo test -f /var/lib/vibebox/init.done && sudo test -f /var/log/vibebox-init.log && ! sudo test -f /var/lib/vibebox/init-log-shown; then echo \"bootstrap log:\"; sudo cat /var/log/vibebox-init.log; sudo touch /var/lib/vibebox/init-log-shown; fi; fi; ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts} ln -sfn /workspace \"$HOME/workspace\"; cd /workspace 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l'"
+        " if [ -e {backing} ] && [ ! -d {backing} ]; then sudo rm -f {backing}; fi; sudo mkdir -p {backing}; if [ -e {guest} ] && [ ! -d {guest} ]; then sudo rm -f {guest}; fi; sudo mkdir -p {guest}; if mountpoint -q {guest} && [ \"$(findmnt -n -o FSTYPE {guest} 2>/dev/null || true)\" = \"virtiofs\" ]; then sudo umount {guest} >/dev/null 2>&1 || true; fi; if ! mountpoint -q {backing}; then {mount_command} fi; if ! mountpoint -q {guest}; then sudo mount --bind {backing} {guest} >/dev/null 2>&1 || true; fi; sudo mount --make-private {guest} >/dev/null 2>&1 || true;",
     )
+}
+
+fn guest_shell_command(shares: &[ShareMount], guest_env: &[GuestEnvVar], verbose: bool) -> String {
+    let mut share_mounts = String::new();
+    for (index, share) in shares.iter().enumerate() {
+        let backing_path = share_backing_mount_path(index);
+        let guest_path = share.guest_path.display().to_string();
+        let mount_command = format!(
+            "sudo mount -t virtiofs {} {} >/dev/null 2>&1 || true;",
+            share_tag(index),
+            shell_quote(&backing_path)
+        );
+        share_mounts.push_str(&bind_mount_command(
+            &backing_path,
+            &guest_path,
+            &mount_command,
+        ));
+    }
+    let guest_env_exports = guest_env
+        .iter()
+        .map(|var| format!(" export {}={};", var.name, shell_quote(&var.value)))
+        .collect::<String>();
+    let git_identity_sync = " if command -v git >/dev/null 2>&1; then if [ -n \"${GIT_AUTHOR_NAME:-}\" ]; then git config --global user.name \"$GIT_AUTHOR_NAME\" >/dev/null 2>&1 || true; fi; if [ -n \"${GIT_AUTHOR_EMAIL:-}\" ]; then git config --global user.email \"$GIT_AUTHOR_EMAIL\" >/dev/null 2>&1 || true; fi; fi;";
+
+    let cloud_init_wait = if verbose {
+        "if command -v cloud-init >/dev/null 2>&1; then CLOUD_INIT_STATUS=\"$(sudo cloud-init status 2>/dev/null || true)\"; if ! printf \"%s\" \"$CLOUD_INIT_STATUS\" | grep -q \"status: done\"; then echo \"waiting for cloud-init/bootstrap...\"; if sudo test -e /var/log/vibebox-init.log; then sudo sh -lc \"tail -n +1 -F /var/log/vibebox-init.log\" & TAIL_PID=$!; fi; sudo cloud-init status --wait >/dev/null 2>&1 || true; if [ -n \"${TAIL_PID:-}\" ]; then kill \"$TAIL_PID\" 2>/dev/null || true; wait \"$TAIL_PID\" 2>/dev/null || true; fi; echo \"cloud-init/bootstrap complete\"; fi; if sudo test -f /var/lib/vibebox/init.done && sudo test -f /var/log/vibebox-init.log && ! sudo test -f /var/lib/vibebox/init-log-shown; then echo \"bootstrap log:\"; sudo cat /var/log/vibebox-init.log; sudo touch /var/lib/vibebox/init-log-shown; fi; fi;"
+    } else {
+        "if command -v cloud-init >/dev/null 2>&1; then sudo cloud-init status --wait >/dev/null 2>&1 || true; fi;"
+    };
+
+    let body = format!(
+        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true;{workspace_mount}{share_mounts}{guest_env_exports}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l",
+        workspace_mount = bind_mount_command(
+            workspace_backing_mount_path(),
+            GUEST_WORKSPACE_PATH,
+            &format!(
+                "sudo mount -t virtiofs {} {} >/dev/null 2>&1 || true;",
+                DEFAULT_WORKSPACE_TAG,
+                shell_quote(workspace_backing_mount_path())
+            )
+        ),
+        nofile_limit = GUEST_NOFILE_LIMIT,
+        workspace_path = GUEST_WORKSPACE_PATH,
+    );
+
+    format!("bash -lc {}", shell_quote(&body))
 }
 
 fn ssh_base_command(
@@ -510,6 +661,7 @@ fn ssh_base_command(
     ssh_private_key: &Path,
     known_hosts: &Path,
     vmnet: &VmnetConfig,
+    forward_agent: bool,
 ) -> Command {
     let mut command = Command::new("ssh");
     let _ = ssh_user;
@@ -529,6 +681,9 @@ fn ssh_base_command(
         .arg("ServerAliveInterval=30")
         .arg("-o")
         .arg("ServerAliveCountMax=3");
+    if forward_agent {
+        command.arg("-A");
+    }
     command
 }
 
@@ -538,7 +693,7 @@ fn probe_ssh(
     known_hosts: &Path,
     vmnet: &VmnetConfig,
 ) -> Result<bool, String> {
-    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet);
+    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false);
     command
         .arg("-o")
         .arg("BatchMode=yes")
@@ -564,27 +719,36 @@ fn ssh_ready_timeout() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_SSH_READY_TIMEOUT_SECS))
 }
 
-struct SshWaitProgress<'a> {
+struct LaunchProgress<'a> {
     guest_ip: &'a str,
+    verbose: bool,
+    quiet_ui: Option<QuietLoadingUi>,
     last_reported_second: Option<u64>,
 }
 
-impl<'a> SshWaitProgress<'a> {
-    fn new(guest_ip: &'a str) -> Self {
+impl<'a> LaunchProgress<'a> {
+    fn new(guest_ip: &'a str, verbose: bool) -> Self {
         Self {
             guest_ip,
+            verbose,
+            quiet_ui: if verbose {
+                None
+            } else {
+                Some(QuietLoadingUi::start())
+            },
             last_reported_second: None,
         }
     }
 
     fn tick(&mut self, elapsed: Duration) -> Result<(), String> {
-        let elapsed_secs = elapsed.as_secs();
-        if self.last_reported_second == Some(elapsed_secs) {
-            return Ok(());
+        if self.verbose {
+            let elapsed_secs = elapsed.as_secs();
+            if self.last_reported_second == Some(elapsed_secs) {
+                return Ok(());
+            }
+            self.last_reported_second = Some(elapsed_secs);
+            eprint!("\rwaiting for ssh on {} ({}s)", self.guest_ip, elapsed_secs);
         }
-
-        self.last_reported_second = Some(elapsed_secs);
-        eprint!("\rwaiting for ssh on {} ({}s)", self.guest_ip, elapsed_secs);
         io::stderr().flush().map_err(|err| err.to_string())
     }
 
@@ -594,8 +758,120 @@ impl<'a> SshWaitProgress<'a> {
             io::stderr().flush().map_err(|err| err.to_string())?;
             self.last_reported_second = None;
         }
+        if let Some(mut quiet_ui) = self.quiet_ui.take() {
+            quiet_ui.finish();
+        }
         Ok(())
     }
+}
+
+fn should_probe_ssh(elapsed: Duration, last_probe: Option<Duration>) -> bool {
+    last_probe
+        .map(|previous| {
+            elapsed.saturating_sub(previous) >= Duration::from_millis(SSH_PROBE_INTERVAL_MILLIS)
+        })
+        .unwrap_or(true)
+}
+
+struct QuietLoadingUi {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl QuietLoadingUi {
+    fn start() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let anchor_row = position().map(|(_, row)| row).unwrap_or(0);
+            let mut terminal = match Terminal::new(CrosstermBackend::new(io::stderr())) {
+                Ok(terminal) => terminal,
+                Err(_) => return,
+            };
+            let started = Instant::now();
+            let _ = execute!(io::stderr(), Hide);
+            while !thread_stop.load(Ordering::Relaxed) {
+                let _ = terminal.draw(|frame| {
+                    let area = frame.area();
+                    if area.height == 0 {
+                        return;
+                    }
+                    let rect = Rect {
+                        x: 0,
+                        y: anchor_row.min(area.height.saturating_sub(1)),
+                        width: area.width,
+                        height: 1,
+                    };
+                    frame.render_widget(Clear, rect);
+                    frame.render_widget(
+                        Paragraph::new(loading_line(started.elapsed())).alignment(Alignment::Left),
+                        rect,
+                    );
+                });
+                thread::sleep(Duration::from_millis(QUIET_LOADING_FRAME_MILLIS));
+            }
+            let _ = execute!(
+                io::stderr(),
+                MoveTo(0, anchor_row),
+                TermClear(ClearType::CurrentLine),
+                Show
+            );
+        });
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for QuietLoadingUi {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn loading_line(elapsed: Duration) -> Line<'static> {
+    const TEXT: &str = "Loading";
+    const BRIGHT_GRAY: u8 = 255;
+    const DARK_GRAY: u8 = 236;
+    const DARK_SPOT_SIGMA: f32 = 1.7;
+    const SHIMMER_SECONDS: f32 = 1.2;
+    const PAUSE_SECONDS: f32 = 0.7;
+
+    let cycle = SHIMMER_SECONDS + PAUSE_SECONDS;
+    let cycle_progress = elapsed.as_secs_f32() % cycle;
+    let len = TEXT.len() as f32;
+    let travel_padding = DARK_SPOT_SIGMA * 2.2;
+    let spans = TEXT
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            let gray = if cycle_progress < SHIMMER_SECONDS {
+                let progress = cycle_progress / SHIMMER_SECONDS;
+                let start = -travel_padding;
+                let end = (len - 1.0) + travel_padding;
+                let head = start + progress * (end - start);
+                let distance = (index as f32 - head).abs();
+                let dip = (-distance.powi(2) / (2.0 * DARK_SPOT_SIGMA.powi(2))).exp();
+                BRIGHT_GRAY as f32 - dip * (BRIGHT_GRAY - DARK_GRAY) as f32
+            } else {
+                BRIGHT_GRAY as f32
+            };
+            Span::styled(
+                ch.to_string(),
+                Style::default().fg(Color::Indexed(gray.round() as u8)),
+            )
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 fn stop_child(child: &mut Child) -> Result<(), String> {
@@ -759,7 +1035,20 @@ fn encode_env_ports(ports: &[PortMapping]) -> String {
 fn encode_env_shares(shares: &[ShareMount]) -> String {
     shares
         .iter()
-        .map(|share| format!("{}:{}", share.host_path.display(), share.guest_path.display()))
+        .map(|share| {
+            format!(
+                "{}:{}",
+                share.host_path.display(),
+                share.guest_path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn encode_guest_env_names(vars: &[GuestEnvVar]) -> String {
+    vars.iter()
+        .map(|var| var.name.as_str())
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -795,12 +1084,15 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 mod tests {
     use super::{
         detect_runtime_failure, encode_env_ports, guest_shell_command, krunkit_network_device,
-        parse_instance_processes, parse_vmnet_helper_processes, running_vm_matches_shares,
-        share_tag, ssh_ready_timeout, stop_stale_vm, write_runtime_shares,
+        loading_line, parse_instance_processes, parse_vmnet_helper_processes,
+        running_vm_matches_shares, share_tag, should_probe_ssh, ssh_base_command,
+        ssh_ready_timeout, stop_stale_vm, write_runtime_shares,
     };
+    use crate::network::VmnetConfig;
     use crate::ports::PortMapping;
-    use crate::state::ShareMount;
+    use crate::state::{GuestEnvVar, ShareMount};
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -830,10 +1122,17 @@ mod tests {
 
     #[test]
     fn guest_shell_waits_for_workspace_readiness() {
-        let command = guest_shell_command(&[ShareMount {
-            host_path: PathBuf::from("/tmp/share"),
-            guest_path: PathBuf::from("/mnt/share"),
-        }]);
+        let command = guest_shell_command(
+            &[ShareMount {
+                host_path: PathBuf::from("/tmp/share"),
+                guest_path: PathBuf::from("/mnt/share"),
+            }],
+            &[GuestEnvVar {
+                name: "ANTHROPIC_API_KEY".to_string(),
+                value: "sk-ant-abc123".to_string(),
+            }],
+            true,
+        );
         assert!(command.contains("cloud-init status --wait"));
         assert!(command.contains("waiting for cloud-init/bootstrap"));
         assert!(command.contains("/var/log/vibebox-init.log"));
@@ -841,10 +1140,92 @@ mod tests {
         assert!(command.contains("init-log-shown"));
         assert!(command.contains("growpart"));
         assert!(command.contains("resize2fs"));
-        assert!(command.contains("rm -f /workspace"));
-        assert!(command.contains("mount -t virtiofs workspace /workspace"));
-        assert!(command.contains(&format!("mount -t virtiofs {} '/mnt/share'", share_tag(0))));
+        assert!(command.contains("/var/lib/vibebox/mounts/workspace"));
+        assert!(command.contains("mount -t virtiofs workspace"));
+        assert!(command.contains("mount --bind"));
+        assert!(command.contains(&format!("mount -t virtiofs {}", share_tag(0))));
+        assert!(command.contains("/mnt/share"));
+        assert!(command.contains("export ANTHROPIC_API_KEY="));
+        assert!(command.contains("git config --global user.name \"$GIT_AUTHOR_NAME\""));
+        assert!(command.contains("git config --global user.email \"$GIT_AUTHOR_EMAIL\""));
         assert!(command.contains("cd /workspace"));
+    }
+
+    #[test]
+    fn quiet_guest_shell_suppresses_bootstrap_chatter() {
+        let command = guest_shell_command(&[], &[], false);
+        assert!(command.contains("cloud-init status --wait >/dev/null 2>&1"));
+        assert!(!command.contains("waiting for cloud-init/bootstrap"));
+        assert!(!command.contains("bootstrap log:"));
+        assert!(!command.contains("/var/log/vibebox-init.log"));
+    }
+
+    #[test]
+    fn interactive_ssh_forwards_agent_but_probes_do_not() {
+        let vmnet = VmnetConfig {
+            client_path: PathBuf::from("/opt/vmnet-helper/bin/vmnet-client"),
+            interface_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            mac_address: "52:54:de:61:b0:1f".to_string(),
+            guest_ip: "192.168.105.33".to_string(),
+            gateway_ip: "192.168.105.1".to_string(),
+            prefix_len: 24,
+            dhcp_start: "192.168.105.1".to_string(),
+            dhcp_end: "192.168.105.254".to_string(),
+            dns_servers: vec!["1.1.1.1".to_string()],
+        };
+        let forwarded_args = ssh_base_command(
+            "joshv",
+            PathBuf::from("/tmp/id_rsa").as_path(),
+            PathBuf::from("/tmp/known_hosts").as_path(),
+            &vmnet,
+            true,
+        )
+        .get_args()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        assert!(forwarded_args.iter().any(|arg| arg == "-A"));
+        assert!(!forwarded_args.iter().any(|arg| arg == "-L"));
+
+        let probe_args = ssh_base_command(
+            "joshv",
+            PathBuf::from("/tmp/id_rsa").as_path(),
+            PathBuf::from("/tmp/known_hosts").as_path(),
+            &vmnet,
+            false,
+        )
+        .get_args()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        assert!(!probe_args.iter().any(|arg| arg == "-A"));
+    }
+
+    #[test]
+    fn loading_line_animates_highlight() {
+        let first = loading_line(Duration::from_millis(0));
+        let second = loading_line(Duration::from_millis(600));
+        assert_eq!(first.width(), "Loading".len());
+        assert_eq!(first.spans.len(), "Loading".len());
+        assert_eq!(first.spans[0].content.as_ref(), "L");
+        assert_eq!(second.spans[1].content.as_ref(), "o");
+        let styles_changed = first
+            .spans
+            .iter()
+            .zip(second.spans.iter())
+            .any(|(left, right)| left.style != right.style);
+        assert!(styles_changed);
+    }
+
+    #[test]
+    fn ssh_probe_interval_is_rate_limited() {
+        assert!(should_probe_ssh(Duration::from_millis(0), None));
+        assert!(!should_probe_ssh(
+            Duration::from_millis(500),
+            Some(Duration::from_millis(0))
+        ));
+        assert!(should_probe_ssh(
+            Duration::from_millis(1000),
+            Some(Duration::from_millis(0))
+        ));
     }
 
     #[test]
@@ -889,6 +1270,7 @@ mod tests {
 
     #[test]
     fn ssh_ready_timeout_uses_default_when_unset_or_invalid() {
+        let saved = env::var("VIBEBOX_SSH_READY_TIMEOUT_SECS").ok();
         unsafe {
             env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
         }
@@ -901,6 +1283,14 @@ mod tests {
 
         unsafe {
             env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
+        }
+        match saved {
+            Some(value) => unsafe {
+                env::set_var("VIBEBOX_SSH_READY_TIMEOUT_SECS", value);
+            },
+            None => unsafe {
+                env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
+            },
         }
     }
 

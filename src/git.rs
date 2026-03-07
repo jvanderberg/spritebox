@@ -1,5 +1,8 @@
-use std::path::Path;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn ensure_checkout(
     checkout_dir: &Path,
@@ -21,6 +24,7 @@ pub fn ensure_checkout(
                 repo
             ));
         }
+        return Ok(());
     }
 
     run_git(&["fetch", "origin", "--prune"], checkout_dir)?;
@@ -60,6 +64,55 @@ pub fn ensure_checkout(
     Err(format!(
         "branch {branch} does not exist; rerun with --new-branch to create it"
     ))
+}
+
+pub fn list_recent_remote_branches(repo: &str, limit: usize) -> Result<Vec<String>, String> {
+    let temp_dir = create_temp_git_dir()?;
+    let result = (|| {
+        run_git(&["init", "--bare"], &temp_dir)?;
+        run_git(&["remote", "add", "origin", repo], &temp_dir)?;
+        run_git(
+            &[
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+            &temp_dir,
+        )?;
+        let _ = run_git(&["remote", "set-head", "origin", "-a"], &temp_dir);
+
+        let mut branches = git_output(
+            &[
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname:lstrip=3)",
+                "refs/remotes/origin",
+            ],
+            &temp_dir,
+        )?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "HEAD")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        branches.sort_by_key(|branch| branch == "HEAD");
+        branches.dedup();
+
+        if let Ok(default_branch) = default_remote_branch(&temp_dir) {
+            if let Some(index) = branches.iter().position(|branch| branch == &default_branch) {
+                let branch = branches.remove(index);
+                branches.insert(0, branch);
+            }
+        }
+
+        branches.truncate(limit);
+        Ok(branches)
+    })();
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
 }
 
 fn default_remote_branch(checkout_dir: &Path) -> Result<String, String> {
@@ -111,4 +164,23 @@ fn git_output(args: &[&str], checkout_dir: &Path) -> Result<String, String> {
     }
 
     String::from_utf8(output.stdout).map_err(|err| err.to_string())
+}
+
+fn create_temp_git_dir() -> Result<PathBuf, String> {
+    let base = env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..64u32 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| err.to_string())?
+            .as_nanos();
+        let path = base.join(format!("vibebox-git-{pid}-{nanos}-{attempt}"));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    Err("failed to create temporary git directory".to_string())
 }

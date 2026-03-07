@@ -1,11 +1,9 @@
 use crate::ports::{DEFAULT_GUEST_PORTS, PortMapping, build_port_mappings, choose_port_block};
-use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
@@ -61,11 +59,17 @@ pub struct ShareMount {
     pub guest_path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GuestEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Instance {
     pub id: String,
-    pub repo: String,
-    pub branch: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
     pub instance_dir: PathBuf,
     pub base_image_id: String,
     pub base_image_name: String,
@@ -76,22 +80,16 @@ pub struct Instance {
     pub host_port_base: u16,
     pub ports: Vec<PortMapping>,
     pub shares: Vec<ShareMount>,
+    pub guest_env: Vec<GuestEnvVar>,
     pub created_unix: u64,
 }
 
 impl Instance {
     pub fn summary_lines(&self) -> Vec<String> {
-        let ports = self
-            .ports
-            .iter()
-            .map(|mapping| format!("{}->{}", mapping.host, mapping.guest))
-            .collect::<Vec<_>>()
-            .join(", ");
-
         vec![
             format!("instance: {}", self.id),
-            format!("repo: {}", self.repo),
-            format!("branch: {}", self.branch),
+            format!("repo: {}", self.repo.as_deref().unwrap_or("none")),
+            format!("branch: {}", self.branch.as_deref().unwrap_or("none")),
             format!("base: {} ({})", self.base_image_name, self.base_image_id),
             format!("instance_dir: {}", self.instance_dir.display()),
             format!("base_image: {}", self.base_image_path.display()),
@@ -102,7 +100,7 @@ impl Instance {
                 self.rootfs_mb
             ),
             format!("shares: {}", summarize_shares(&self.shares)),
-            format!("ports: {ports}"),
+            format!("guest_env: {}", summarize_guest_env(&self.guest_env)),
         ]
     }
 }
@@ -177,12 +175,15 @@ pub fn list_base_images() -> Result<Vec<BaseImage>, String> {
 }
 
 pub fn ensure_instance(
-    repo: &str,
-    branch: &str,
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
     requested_base: Option<&str>,
     requested_shares: Option<&[ShareMount]>,
+    requested_guest_env: Option<&[GuestEnvVar]>,
 ) -> Result<Instance, String> {
-    let paths = paths_for(repo, branch)?;
+    validate_instance_selector(name, repo, branch, requested_base)?;
+    let paths = ensure_instance_paths(name, repo, branch, requested_base)?;
     fs::create_dir_all(&paths.checkout_dir).map_err(io_err)?;
     fs::create_dir_all(paths.instance_dir.join("vm")).map_err(io_err)?;
 
@@ -201,7 +202,7 @@ pub fn ensure_instance(
         .map(|instance| instance.host_port_base)
         .collect::<Vec<_>>();
     let host_port_base = choose_port_block(
-        &format!("{repo}|{branch}"),
+        &instance_identity_string(name, repo, branch, requested_base),
         existing.as_ref().map(|instance| instance.host_port_base),
         &used_host_bases,
     )?;
@@ -211,12 +212,25 @@ pub fn ensure_instance(
     let rootfs_mb = bytes_to_mib(fs::metadata(&paths.rootfs_path).map_err(io_err)?.len());
     let shares = requested_shares
         .map(|items| normalize_shares(items.to_vec()))
-        .unwrap_or_else(|| existing.as_ref().map(|instance| instance.shares.clone()).unwrap_or_default());
+        .unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|instance| instance.shares.clone())
+                .unwrap_or_default()
+        });
+    let guest_env = requested_guest_env
+        .map(|items| normalize_guest_env(items.to_vec()))
+        .unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|instance| instance.guest_env.clone())
+                .unwrap_or_default()
+        });
 
     let instance = Instance {
         id: current_id,
-        repo: repo.to_string(),
-        branch: branch.to_string(),
+        repo: repo.map(str::to_string),
+        branch: branch.map(str::to_string),
         instance_dir: paths.instance_dir,
         base_image_id: base.id.clone(),
         base_image_name: base.name.clone(),
@@ -227,6 +241,7 @@ pub fn ensure_instance(
         host_port_base,
         ports: build_port_mappings(host_port_base, &DEFAULT_GUEST_PORTS),
         shares,
+        guest_env,
         created_unix: existing
             .map(|instance| instance.created_unix)
             .unwrap_or_else(now_unix),
@@ -236,8 +251,14 @@ pub fn ensure_instance(
     Ok(instance)
 }
 
-pub fn find_instance(repo: &str, branch: &str) -> Result<Option<Instance>, String> {
-    let paths = paths_for(repo, branch)?;
+pub fn find_instance(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<Option<Instance>, String> {
+    validate_instance_selector(name, repo, branch, base)?;
+    let paths = resolve_instance_paths(name, repo, branch, base)?;
     load_instance(&paths.metadata_path)
 }
 
@@ -261,8 +282,14 @@ pub fn list_instances() -> Result<Vec<Instance>, String> {
     Ok(instances)
 }
 
-pub fn destroy_instance(repo: &str, branch: &str) -> Result<Option<PathBuf>, String> {
-    let paths = paths_for(repo, branch)?;
+pub fn destroy_instance(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    validate_instance_selector(name, repo, branch, base)?;
+    let paths = resolve_instance_paths(name, repo, branch, base)?;
     if !paths.instance_dir.exists() {
         return Ok(None);
     }
@@ -281,7 +308,11 @@ pub fn parse_share(spec: &str) -> Result<ShareMount, String> {
         ));
     }
 
-    let host_path = normalize_host_share_path(host)?;
+    share_mount(&expand_tilde(host), Path::new(guest))
+}
+
+pub fn share_mount(host_path: &Path, guest_path: &Path) -> Result<ShareMount, String> {
+    let host_path = normalize_host_share_path(host_path)?;
     if !host_path.is_dir() {
         return Err(format!(
             "shared host path {} is not a directory",
@@ -289,7 +320,6 @@ pub fn parse_share(spec: &str) -> Result<ShareMount, String> {
         ));
     }
 
-    let guest_path = PathBuf::from(guest);
     if !guest_path.is_absolute() {
         return Err(format!(
             "shared guest path {} must be absolute",
@@ -302,7 +332,7 @@ pub fn parse_share(spec: &str) -> Result<ShareMount, String> {
 
     Ok(ShareMount {
         host_path,
-        guest_path,
+        guest_path: guest_path.to_path_buf(),
     })
 }
 
@@ -325,10 +355,7 @@ fn resolve_base_image(
         (Some(instance), None) => find_base_image(&instance.base_image_name)?
             .filter(|base| base.id == instance.base_image_id)
             .ok_or_else(|| {
-                format!(
-                    "base image {} for this instance is missing; re-import it or destroy the instance",
-                    instance.base_image_name
-                )
+                format!("base image {} for this instance is missing; re-import it or destroy the instance", instance.base_image_name)
             }),
         (None, Some(name)) => find_base_image(name)?
             .ok_or_else(|| format!("base image {name} does not exist; import it first")),
@@ -446,16 +473,15 @@ fn base_paths(name: &str) -> Result<BasePaths, String> {
     })
 }
 
-fn paths_for(repo: &str, branch: &str) -> Result<InstancePaths, String> {
+fn paths_for(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<InstancePaths, String> {
     let home = app_home()?;
-    let id = instance_id(repo, branch);
-    let instance_dir = home.join("instances").join(&id);
-    Ok(InstancePaths {
-        checkout_dir: instance_dir.join("checkout"),
-        rootfs_path: instance_dir.join("vm").join("branch.img"),
-        metadata_path: instance_dir.join("instance.env"),
-        instance_dir,
-    })
+    let id = instance_id(name, repo, branch, base)?;
+    Ok(instance_paths_for_id(home.join("instances").join(&id)))
 }
 
 fn base_image_id(name: &str) -> Result<String, String> {
@@ -466,14 +492,127 @@ fn base_image_id(name: &str) -> Result<String, String> {
     Ok(id)
 }
 
-fn instance_id(repo: &str, branch: &str) -> String {
-    let repo_slug = slugify(repo);
-    let branch_slug = slugify(branch);
+fn instance_id(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<String, String> {
+    match (name, repo, branch) {
+        (Some(name), None, None) => {
+            let id = slugify(name);
+            if id.is_empty() {
+                Err("instance name must contain at least one alphanumeric character".to_string())
+            } else {
+                Ok(id)
+            }
+        }
+        (None, Some(repo), Some(branch)) => {
+            let repo_slug = slugify(&repo_basename(repo));
+            let branch_slug = slugify(branch);
+            if repo_slug.is_empty() || branch_slug.is_empty() {
+                return Err(
+                    "repo and branch must contain at least one alphanumeric character".to_string(),
+                );
+            }
+            Ok(format!("{repo_slug}-{branch_slug}"))
+        }
+        (None, None, None) => {
+            let base = base.ok_or_else(|| {
+                "base is required when launching without --repo/--branch".to_string()
+            })?;
+            let base_slug = slugify(base);
+            if base_slug.is_empty() {
+                return Err("base must contain at least one alphanumeric character".to_string());
+            }
+            Ok(format!("base-{base_slug}"))
+        }
+        (Some(_), _, _) => Err("--name cannot be combined with --repo/--branch".to_string()),
+        _ => Err("--repo and --branch must be provided together".to_string()),
+    }
+}
+
+fn legacy_instance_id(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<Option<String>, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     let mut hasher = DefaultHasher::new();
-    repo.hash(&mut hasher);
-    branch.hash(&mut hasher);
-    let digest = hasher.finish();
-    format!("{repo_slug}--{branch_slug}--{digest:08x}")
+    match (name, repo, branch) {
+        (Some(_), None, None) => Ok(None),
+        (None, Some(repo), Some(branch)) => {
+            let repo_slug = slugify(repo);
+            let branch_slug = slugify(branch);
+            repo.hash(&mut hasher);
+            branch.hash(&mut hasher);
+            let digest = hasher.finish();
+            Ok(Some(format!("{repo_slug}--{branch_slug}--{digest:08x}")))
+        }
+        (None, None, None) => {
+            let base = base.ok_or_else(|| {
+                "base is required when launching without --repo/--branch".to_string()
+            })?;
+            let base_slug = slugify(base);
+            "base-only".hash(&mut hasher);
+            base.hash(&mut hasher);
+            let digest = hasher.finish();
+            Ok(Some(format!("base--{base_slug}--{digest:08x}")))
+        }
+        (Some(_), _, _) => Err("--name cannot be combined with --repo/--branch".to_string()),
+        _ => Err("--repo and --branch must be provided together".to_string()),
+    }
+}
+
+fn validate_instance_selector(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<(), String> {
+    match (name, repo, branch) {
+        (Some(_), None, None) => Ok(()),
+        (Some(_), _, _) => Err("--name cannot be combined with --repo/--branch".to_string()),
+        (None, Some(repo), Some(branch)) => {
+            let _ = (repo, branch, base);
+            Ok(())
+        }
+        (None, None, None) => {
+            let base = base.ok_or_else(|| {
+                "base is required when launching without --repo/--branch".to_string()
+            })?;
+            let _ = base;
+            Ok(())
+        }
+        _ => Err("--repo and --branch must be provided together".to_string()),
+    }
+}
+
+fn instance_identity_string(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> String {
+    match (name, repo, branch) {
+        (Some(name), None, None) => format!("name|{name}"),
+        (None, Some(repo), Some(branch)) => format!("{repo}|{branch}"),
+        (None, None, None) => format!("base|{}", base.unwrap_or_default()),
+        _ => "invalid".to_string(),
+    }
+}
+
+fn repo_basename(repo: &str) -> String {
+    let trimmed = repo.trim_end_matches('/');
+    trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches(".git")
+        .to_string()
 }
 
 fn slugify(value: &str) -> String {
@@ -500,19 +639,20 @@ fn slugify(value: &str) -> String {
     slug.trim_matches('-').chars().take(48).collect()
 }
 
-fn normalize_host_share_path(value: &str) -> Result<PathBuf, String> {
-    let expanded = expand_tilde(value);
-    fs::canonicalize(&expanded).map_err(|err| {
+fn normalize_host_share_path(path: &Path) -> Result<PathBuf, String> {
+    fs::canonicalize(path).map_err(|err| {
         format!(
             "failed to resolve shared host path {}: {err}",
-            expanded.display()
+            path.display()
         )
     })
 }
 
 fn expand_tilde(value: &str) -> PathBuf {
     if value == "~" {
-        return env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(value));
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(value));
     }
     if let Some(rest) = value.strip_prefix("~/") {
         if let Some(home) = env::var_os("HOME") {
@@ -528,6 +668,75 @@ fn normalize_shares(mut shares: Vec<ShareMount>) -> Vec<ShareMount> {
     shares
 }
 
+fn normalize_guest_env(mut vars: Vec<GuestEnvVar>) -> Vec<GuestEnvVar> {
+    vars.sort_by(|left, right| left.name.cmp(&right.name));
+    vars.dedup_by(|left, right| left.name == right.name);
+    vars
+}
+
+fn resolve_instance_paths(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<InstancePaths, String> {
+    let current = paths_for(name, repo, branch, base)?;
+    if current.instance_dir.exists() {
+        return Ok(current);
+    }
+
+    if let Some(legacy_id) = legacy_instance_id(name, repo, branch, base)? {
+        let home = app_home()?;
+        let legacy = instance_paths_for_id(home.join("instances").join(legacy_id));
+        if legacy.instance_dir.exists() {
+            return Ok(legacy);
+        }
+    }
+
+    Ok(current)
+}
+
+fn ensure_instance_paths(
+    name: Option<&str>,
+    repo: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<InstancePaths, String> {
+    let current = paths_for(name, repo, branch, base)?;
+    if current.instance_dir.exists() {
+        return Ok(current);
+    }
+
+    if let Some(legacy_id) = legacy_instance_id(name, repo, branch, base)? {
+        let home = app_home()?;
+        let legacy = instance_paths_for_id(home.join("instances").join(&legacy_id));
+        if legacy.instance_dir.exists() {
+            fs::rename(&legacy.instance_dir, &current.instance_dir).map_err(io_err)?;
+            if let Some(mut instance) = load_instance(&current.metadata_path)? {
+                instance.id = current
+                    .instance_dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                save_instance(&current.metadata_path, &instance)?;
+            }
+            return Ok(current);
+        }
+    }
+
+    Ok(current)
+}
+
+fn instance_paths_for_id(instance_dir: PathBuf) -> InstancePaths {
+    InstancePaths {
+        checkout_dir: instance_dir.join("checkout"),
+        rootfs_path: instance_dir.join("vm").join("branch.img"),
+        metadata_path: instance_dir.join("instance.env"),
+        instance_dir,
+    }
+}
+
 fn load_instance(path: &Path) -> Result<Option<Instance>, String> {
     if !path.exists() {
         return Ok(None);
@@ -536,8 +745,8 @@ fn load_instance(path: &Path) -> Result<Option<Instance>, String> {
     let values = load_env_file(path)?;
     Ok(Some(Instance {
         id: required_string(&values, "id", path)?,
-        repo: required_string(&values, "repo", path)?,
-        branch: required_string(&values, "branch", path)?,
+        repo: optional_string(&values, "repo").filter(|value| !value.is_empty()),
+        branch: optional_string(&values, "branch").filter(|value| !value.is_empty()),
         instance_dir: path
             .parent()
             .ok_or_else(|| format!("{} has no parent directory", path.display()))?
@@ -554,6 +763,10 @@ fn load_instance(path: &Path) -> Result<Option<Instance>, String> {
             .map(|value| parse_shares(&value))
             .transpose()?
             .unwrap_or_default(),
+        guest_env: optional_string(&values, "guest_env")
+            .map(|value| parse_guest_env(&value))
+            .transpose()?
+            .unwrap_or_default(),
         created_unix: required_u64(&values, "created_unix", path)?,
     }))
 }
@@ -566,8 +779,8 @@ fn save_instance(path: &Path, instance: &Instance) -> Result<(), String> {
 
     let mut file = File::create(path).map_err(io_err)?;
     writeln!(file, "id={}", instance.id).map_err(io_err)?;
-    writeln!(file, "repo={}", instance.repo).map_err(io_err)?;
-    writeln!(file, "branch={}", instance.branch).map_err(io_err)?;
+    writeln!(file, "repo={}", instance.repo.as_deref().unwrap_or("")).map_err(io_err)?;
+    writeln!(file, "branch={}", instance.branch.as_deref().unwrap_or("")).map_err(io_err)?;
     writeln!(file, "base_image_id={}", instance.base_image_id).map_err(io_err)?;
     writeln!(file, "base_image_name={}", instance.base_image_name).map_err(io_err)?;
     writeln!(
@@ -582,6 +795,7 @@ fn save_instance(path: &Path, instance: &Instance) -> Result<(), String> {
     writeln!(file, "host_port_base={}", instance.host_port_base).map_err(io_err)?;
     writeln!(file, "ports={}", encode_ports(&instance.ports)).map_err(io_err)?;
     writeln!(file, "shares={}", encode_shares(&instance.shares)).map_err(io_err)?;
+    writeln!(file, "guest_env={}", encode_guest_env(&instance.guest_env)).map_err(io_err)?;
     writeln!(file, "created_unix={}", instance.created_unix).map_err(io_err)?;
     Ok(())
 }
@@ -694,7 +908,24 @@ fn summarize_shares(shares: &[ShareMount]) -> String {
 
     shares
         .iter()
-        .map(|share| format!("{}->{}", share.host_path.display(), share.guest_path.display()))
+        .map(|share| {
+            format!(
+                "{}->{}",
+                share.host_path.display(),
+                share.guest_path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn summarize_guest_env(vars: &[GuestEnvVar]) -> String {
+    if vars.is_empty() {
+        return "none".to_string();
+    }
+
+    vars.iter()
+        .map(|var| var.name.clone())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -725,6 +956,33 @@ fn parse_shares(value: &str) -> Result<Vec<ShareMount>, String> {
         });
     }
     Ok(normalize_shares(shares))
+}
+
+fn encode_guest_env(vars: &[GuestEnvVar]) -> String {
+    vars.iter()
+        .map(|var| {
+            format!(
+                "{}:{}",
+                percent_encode(&var.name),
+                percent_encode(&var.value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_guest_env(value: &str) -> Result<Vec<GuestEnvVar>, String> {
+    let mut vars = Vec::new();
+    for item in value.split(',').filter(|item| !item.is_empty()) {
+        let (name, env_value) = item
+            .split_once(':')
+            .ok_or_else(|| format!("invalid guest env mapping: {item}"))?;
+        vars.push(GuestEnvVar {
+            name: percent_decode(name)?,
+            value: percent_decode(env_value)?,
+        });
+    }
+    Ok(normalize_guest_env(vars))
 }
 
 fn percent_encode(value: &str) -> String {
@@ -783,16 +1041,28 @@ struct BasePaths {
 
 #[cfg(test)]
 mod tests {
-    use super::{desired_rootfs_mib, encode_shares, parse_shares, ShareMount};
+    use super::{
+        GuestEnvVar, ShareMount, desired_rootfs_mib, encode_guest_env, encode_shares,
+        parse_guest_env, parse_shares,
+    };
     use std::env;
     use std::path::PathBuf;
 
     #[test]
     fn desired_rootfs_defaults_to_large_sparse_disk() {
+        let saved = env::var("VIBEBOX_ROOTFS_MIB").ok();
         unsafe {
             env::remove_var("VIBEBOX_ROOTFS_MIB");
         }
         assert_eq!(desired_rootfs_mib(2252), 32 * 1024);
+        match saved {
+            Some(value) => unsafe {
+                env::set_var("VIBEBOX_ROOTFS_MIB", value);
+            },
+            None => unsafe {
+                env::remove_var("VIBEBOX_ROOTFS_MIB");
+            },
+        }
     }
 
     #[test]
@@ -832,5 +1102,22 @@ mod tests {
 
         let encoded = encode_shares(&shares);
         assert_eq!(parse_shares(&encoded).unwrap(), shares);
+    }
+
+    #[test]
+    fn guest_env_round_trip_through_metadata_encoding() {
+        let vars = vec![
+            GuestEnvVar {
+                name: "ANTHROPIC_API_KEY".to_string(),
+                value: "sk-ant-abc123".to_string(),
+            },
+            GuestEnvVar {
+                name: "OPENAI_API_KEY".to_string(),
+                value: "sk-openai-xyz".to_string(),
+            },
+        ];
+
+        let encoded = encode_guest_env(&vars);
+        assert_eq!(parse_guest_env(&encoded).unwrap(), vars);
     }
 }

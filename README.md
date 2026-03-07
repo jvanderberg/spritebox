@@ -17,6 +17,9 @@ By default, branch disks are expanded to a sparse 32 GiB rootfs even if the impo
 
 While developing inside this repo, invoke it with `cargo run -- ...`. After building, the binary is `./target/debug/vibebox`.
 
+If you run `vibebox` with no arguments, it behaves like `vibebox launch` and tries to boot a standalone VM using the newest imported base image.
+If you pass top-level flags, `launch` is also implied, so `vibebox --base ubuntu` works the same as `vibebox launch --base ubuntu`.
+
 ## Prerequisites
 
 The built-in VM path is currently aimed at macOS with APFS.
@@ -59,6 +62,18 @@ cargo run -- launch \
   --branch main \
   --base ubuntu \
   --init-script ./scripts/bootstrap-vm.sh
+```
+
+You can also launch a base-only VM with no repo checkout at all:
+
+```bash
+cargo run -- launch --base ubuntu
+```
+
+If you do that without `--name`, `vibebox` generates a persistent petname-style instance name and uses it as the guest hostname too. Git-backed instances use the simple `<project>-<branch>` form. If you want a stable, explicit name instead:
+
+```bash
+cargo run -- launch --name tools-box --base ubuntu
 ```
 
 ## Getting a Base Image
@@ -108,6 +123,12 @@ cargo run -- base capture \
   --name ubuntu-dev \
   --repo git@github.com:org/repo.git \
   --branch main
+```
+
+Or capture a base-only instance:
+
+```bash
+cargo run -- base capture --name ubuntu-dev --instance tools-box
 ```
 
 List imported bases:
@@ -163,6 +184,22 @@ Prepare and enter an existing branch:
 cargo run -- launch --repo git@github.com:org/repo.git --branch main --base ubuntu-24.04
 ```
 
+If you provide `--repo` without `--branch`, `vibebox` will fetch a short list of recent remote branches and prompt you to choose one interactively.
+
+Boot a base-only VM with an empty persistent workspace:
+
+```bash
+cargo run -- launch --base ubuntu-24.04
+```
+
+Boot a named standalone VM:
+
+```bash
+cargo run -- launch --name tools-box --base ubuntu-24.04
+```
+
+If you omit `--base` for a new launch, `vibebox` will pick the newest imported base image automatically.
+
 Create a new branch from the remote default branch:
 
 ```bash
@@ -180,6 +217,8 @@ Print the prepared workspace without entering a shell:
 ```bash
 cargo run -- launch --repo git@github.com:org/repo.git --branch main --base ubuntu-24.04 --no-enter
 ```
+
+By default, `vibebox` keeps launch output quiet and shows a single in-place `Loading` pulse while the VM becomes reachable. If you want the full instance summary and bootstrap chatter, add `--verbose`.
 
 Tune VM size explicitly:
 
@@ -224,6 +263,26 @@ cargo run -- launch \
   --share ~/src/shared-assets:/mnt/assets
 ```
 
+Map your local Codex and Claude config directories into the guest home:
+
+```bash
+cargo run -- --base ubuntu-24.04 --with-ai
+```
+
+Or enable them individually:
+
+```bash
+cargo run -- --base ubuntu-24.04 --with-codex
+cargo run -- --base ubuntu-24.04 --with-claude
+cargo run -- --base ubuntu-24.04 --with-gh
+```
+
+That maps `~/.codex` to `/home/<guest-user>/.codex` and `~/.claude` to `/home/<guest-user>/.claude`. These mounts persist like any other share, so you typically only need to pass the flag once per instance. This shares the full config directories, not just auth tokens.
+
+If `ANTHROPIC_API_KEY` is set in the host environment, `--with-claude` also exports it into the guest shell as `ANTHROPIC_API_KEY` on connect. Claude Pro/web-login state still does not cross from macOS into the Linux guest.
+
+If the host `gh` CLI is authenticated, `--with-gh` exports its `gh auth token` value into the guest as `GH_TOKEN`. If `~/.config/gh` exists on the host, that directory is also shared into the guest.
+
 The checkout is always shared at `/workspace`. Extra `--share` entries are persisted with the instance, so a plain later `launch` reuses them. If you change the share set for a running VM, `vibebox` will restart that VM on relaunch to apply the new mounts. Remove all saved extra shares with:
 
 ```bash
@@ -234,23 +293,35 @@ Inspect or remove a branch instance:
 
 ```bash
 cargo run -- status --repo git@github.com:org/repo.git --branch main
+cargo run -- stop --repo git@github.com:org/repo.git --branch main
 cargo run -- destroy --repo git@github.com:org/repo.git --branch main
 ```
 
-## Port Mapping
+`stop` shuts down the VM but keeps the instance checkout and root filesystem. `destroy` removes the instance entirely.
+Pass `--yes` to `destroy` if you need to skip the confirmation prompt.
 
-The launcher reserves a deterministic host port block and maps common guest dev ports:
+Inspect or remove a base-only instance:
 
-- `22`
-- `3000`
-- `5173`
-- `5432`
-- `6379`
-- `8000`
-- `8080`
-- `8081`
+```bash
+cargo run -- status --name tools-box
+cargo run -- destroy --name tools-box
+```
 
-The first free block is persisted in `instance.env`, so the same branch keeps the same host ports over time.
+List all instances and whether they are currently running:
+
+```bash
+cargo run -- list
+```
+
+## Service Access
+
+Services in the guest should be reached through the guest IP or the guest `.local` hostname, for example:
+
+- `http://police-station-main.local:3000`
+- `http://police-station-main.local:5173`
+- `ssh joshv@police-station-main.local`
+
+`vibebox` does not create `localhost` port forwards by default.
 
 ## Built-In VM Runtime
 
