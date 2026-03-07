@@ -7,7 +7,6 @@ use std::process::{Command, Stdio};
 
 const DEFAULT_CLOUD_USER: &str = "vibe";
 const SSH_KEY_BASENAMES: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
-const GUEST_MOUNT_ROOT: &str = "/var/lib/vibebox/mounts";
 const GUEST_WORKSPACE_PATH: &str = "/workspace";
 const DEFAULT_NOFILE_LIMIT: u64 = 65_536;
 
@@ -358,32 +357,28 @@ fi
 }
 
 fn render_mounts(shares: &[ShareMount]) -> String {
-    let mut lines = vec![format!(
-        "  - [ workspace, \"{}\", virtiofs, \"defaults,nofail\", \"0\", \"0\" ]",
-        yaml_escape(workspace_backing_mount_path())
-    )];
-    for index in 0..shares.len() {
+    let mut lines = vec![
+        "  - [ workspace, /workspace, virtiofs, \"defaults,nofail\", \"0\", \"0\" ]".to_string(),
+    ];
+    for (index, share) in shares.iter().enumerate() {
         lines.push(format!(
             "  - [ {}, \"{}\", virtiofs, \"defaults,nofail\", \"0\", \"0\" ]",
             share_tag(index),
-            yaml_escape(&share_backing_mount_path(index))
+            yaml_escape(&share.guest_path.display().to_string())
         ));
     }
     lines.join("\n")
 }
 
 fn render_bootcmd(shares: &[ShareMount]) -> String {
-    let mut lines = vec![format!(
-        "  - [ sh, -lc, \"{}\" ]",
-        prepare_dir_command(workspace_backing_mount_path(), GUEST_WORKSPACE_PATH)
-    )];
+    let mut lines = vec![
+        "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace\" ]".to_string(),
+    ];
     for (index, share) in shares.iter().enumerate() {
+        let _ = index;
         lines.push(format!(
-            "  - [ sh, -lc, \"{}\" ]",
-            prepare_dir_command(
-                &share_backing_mount_path(index),
-                &share.guest_path.display().to_string()
-            )
+            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}\" ]",
+            path = shell_quote(&share.guest_path.display().to_string())
         ));
     }
     lines.join("\n")
@@ -393,18 +388,13 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
     let mut lines = vec![
         "  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon; fi\" ]".to_string(),
         "  - [ systemctl, enable, --now, avahi-daemon ]".to_string(),
-        format!(
-            "  - [ sh, -lc, \"{}\" ]",
-            bind_mount_command(workspace_backing_mount_path(), GUEST_WORKSPACE_PATH)
-        ),
+        "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]".to_string(),
     ];
     for (index, share) in shares.iter().enumerate() {
+        let _ = index;
         lines.push(format!(
-            "  - [ sh, -lc, \"{}\" ]",
-            bind_mount_command(
-                &share_backing_mount_path(index),
-                &share.guest_path.display().to_string()
-            )
+            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}; mountpoint -q {path} || mount {path} || true\" ]",
+            path = shell_quote(&share.guest_path.display().to_string())
         ));
     }
     if includes_init_script {
@@ -420,31 +410,6 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
         GUEST_WORKSPACE_PATH
     ));
     lines.join("\n")
-}
-
-fn workspace_backing_mount_path() -> &'static str {
-    "/var/lib/vibebox/mounts/workspace"
-}
-
-fn share_backing_mount_path(index: usize) -> String {
-    format!("{GUEST_MOUNT_ROOT}/{}", share_tag(index))
-}
-
-fn prepare_dir_command(backing_path: &str, guest_path: &str) -> String {
-    let backing = shell_quote(backing_path);
-    let guest = shell_quote(guest_path);
-    format!(
-        "if [ -e {backing} ] && [ ! -d {backing} ]; then rm -f {backing}; fi; mkdir -p {backing}; if [ -e {guest} ] && [ ! -d {guest} ]; then rm -f {guest}; fi; mkdir -p {guest}"
-    )
-}
-
-fn bind_mount_command(backing_path: &str, guest_path: &str) -> String {
-    let backing = shell_quote(backing_path);
-    let guest = shell_quote(guest_path);
-    format!(
-        "{}; if mountpoint -q {guest} && [ \"$(findmnt -n -o FSTYPE {guest} 2>/dev/null || true)\" = \"virtiofs\" ]; then umount {guest} || true; fi; mountpoint -q {backing} || mount {backing} || true; mountpoint -q {guest} || mount --bind {backing} {guest} || true; mount --make-private {guest} >/dev/null 2>&1 || true",
-        prepare_dir_command(backing_path, guest_path)
-    )
 }
 
 fn render_common_write_files(user: &str) -> String {
@@ -547,13 +512,12 @@ mod tests {
         assert!(rendered.contains("name: vibe"));
         assert!(rendered.contains("uid: 501"));
         assert!(rendered.contains("ssh-ed25519 AAAATEST"));
-        assert!(rendered.contains("mkdir -p '/var/lib/vibebox/mounts/workspace'"));
+        assert!(rendered.contains("rm -f /workspace"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-vibebox.conf"));
         assert!(rendered.contains("* soft nofile 65536"));
-        assert!(rendered.contains("workspace, \"/var/lib/vibebox/mounts/workspace\", virtiofs"));
-        assert!(rendered.contains("mount --bind '/var/lib/vibebox/mounts/workspace' '/workspace'"));
+        assert!(rendered.contains("workspace, /workspace, virtiofs"));
         assert!(rendered.contains("ln, -sfn, /workspace, /home/vibe/workspace"));
     }
 
@@ -586,8 +550,7 @@ mod tests {
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-vibebox.conf"));
-        assert!(rendered.contains("[ share0, \"/var/lib/vibebox/mounts/share0\", virtiofs"));
-        assert!(rendered.contains("mount --bind '/var/lib/vibebox/mounts/share0' '/mnt/share'"));
+        assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
     }
 
     #[test]

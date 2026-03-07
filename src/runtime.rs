@@ -30,7 +30,6 @@ const DEFAULT_WORKSPACE_TAG: &str = "workspace";
 const DEFAULT_SSH_READY_TIMEOUT_SECS: u64 = 300;
 const QUIET_LOADING_FRAME_MILLIS: u64 = 16;
 const SSH_PROBE_INTERVAL_MILLIS: u64 = 1000;
-const GUEST_MOUNT_ROOT: &str = "/var/lib/vibebox/mounts";
 const GUEST_WORKSPACE_PATH: &str = "/workspace";
 const GUEST_NOFILE_LIMIT: u64 = 65_536;
 const HOST_NOFILE_LIMIT: u64 = 65_536;
@@ -594,36 +593,13 @@ fn set_current_process_nofile_limit(limit: libc::rlim_t) -> Result<(), IoError> 
     Ok(())
 }
 
-fn workspace_backing_mount_path() -> &'static str {
-    "/var/lib/vibebox/mounts/workspace"
-}
-
-fn share_backing_mount_path(index: usize) -> String {
-    format!("{GUEST_MOUNT_ROOT}/{}", share_tag(index))
-}
-
-fn bind_mount_command(backing_path: &str, guest_path: &str, mount_command: &str) -> String {
-    let backing = shell_quote(backing_path);
-    let guest = shell_quote(guest_path);
-    format!(
-        " if [ -e {backing} ] && [ ! -d {backing} ]; then sudo rm -f {backing}; fi; sudo mkdir -p {backing}; if [ -e {guest} ] && [ ! -d {guest} ]; then sudo rm -f {guest}; fi; sudo mkdir -p {guest}; if mountpoint -q {guest} && [ \"$(findmnt -n -o FSTYPE {guest} 2>/dev/null || true)\" = \"virtiofs\" ]; then sudo umount {guest} >/dev/null 2>&1 || true; fi; if ! mountpoint -q {backing}; then {mount_command} fi; if ! mountpoint -q {guest}; then sudo mount --bind {backing} {guest} >/dev/null 2>&1 || true; fi; sudo mount --make-private {guest} >/dev/null 2>&1 || true;",
-    )
-}
-
 fn guest_shell_command(shares: &[ShareMount], guest_env: &[GuestEnvVar], verbose: bool) -> String {
     let mut share_mounts = String::new();
     for (index, share) in shares.iter().enumerate() {
-        let backing_path = share_backing_mount_path(index);
-        let guest_path = share.guest_path.display().to_string();
-        let mount_command = format!(
-            "sudo mount -t virtiofs {} {} >/dev/null 2>&1 || true;",
-            share_tag(index),
-            shell_quote(&backing_path)
-        );
-        share_mounts.push_str(&bind_mount_command(
-            &backing_path,
-            &guest_path,
-            &mount_command,
+        let path = shell_quote(&share.guest_path.display().to_string());
+        share_mounts.push_str(&format!(
+            " if [ -e {path} ] && [ ! -d {path} ]; then sudo rm -f {path}; fi; sudo mkdir -p {path}; if ! mountpoint -q {path}; then sudo mount -t virtiofs {} {path} >/dev/null 2>&1 || true; fi;",
+            share_tag(index)
         ));
     }
     let guest_env_exports = guest_env
@@ -639,16 +615,7 @@ fn guest_shell_command(shares: &[ShareMount], guest_env: &[GuestEnvVar], verbose
     };
 
     let body = format!(
-        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true;{workspace_mount}{share_mounts}{guest_env_exports}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l",
-        workspace_mount = bind_mount_command(
-            workspace_backing_mount_path(),
-            GUEST_WORKSPACE_PATH,
-            &format!(
-                "sudo mount -t virtiofs {} {} >/dev/null 2>&1 || true;",
-                DEFAULT_WORKSPACE_TAG,
-                shell_quote(workspace_backing_mount_path())
-            )
-        ),
+        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts}{guest_env_exports}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l",
         nofile_limit = GUEST_NOFILE_LIMIT,
         workspace_path = GUEST_WORKSPACE_PATH,
     );
@@ -1140,9 +1107,8 @@ mod tests {
         assert!(command.contains("init-log-shown"));
         assert!(command.contains("growpart"));
         assert!(command.contains("resize2fs"));
-        assert!(command.contains("/var/lib/vibebox/mounts/workspace"));
-        assert!(command.contains("mount -t virtiofs workspace"));
-        assert!(command.contains("mount --bind"));
+        assert!(command.contains("rm -f /workspace"));
+        assert!(command.contains("mount -t virtiofs workspace /workspace"));
         assert!(command.contains(&format!("mount -t virtiofs {}", share_tag(0))));
         assert!(command.contains("/mnt/share"));
         assert!(command.contains("export ANTHROPIC_API_KEY="));
