@@ -164,7 +164,7 @@ struct DestroyOptions {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "vibebox",
+    name = "yolobox",
     disable_help_subcommand = true,
     args_conflicts_with_subcommands = true
 )]
@@ -195,7 +195,7 @@ struct ClapBaseCommand {
 
 impl Cli {
     fn parse(args: Vec<String>) -> Result<Self, String> {
-        let parse_input = std::iter::once("vibebox".to_string())
+        let parse_input = std::iter::once("yolobox".to_string())
             .chain(args)
             .collect::<Vec<_>>();
         let cli = match ClapCli::try_parse_from(parse_input) {
@@ -688,20 +688,20 @@ fn missing_base_guidance() -> String {
         "Get a Linux guest image and import one first. Example:",
         "  curl -LO https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img",
         "  qemu-img convert -f qcow2 -O raw jammy-server-cloudimg-arm64.img ubuntu-jammy-arm64.raw",
-        "  vibebox base import --name ubuntu --image ./ubuntu-jammy-arm64.raw",
+        "  yolobox base import --name ubuntu --image ./ubuntu-jammy-arm64.raw",
         "",
         "Then launch:",
-        "  vibebox --base ubuntu",
+        "  yolobox --base ubuntu",
         "",
         "For a full environment check:",
-        "  vibebox doctor",
+        "  yolobox doctor",
     ]
     .join("\n")
 }
 
 fn missing_vm_runtime_guidance() -> String {
     let mut lines = vec![
-        "vibebox cannot launch a VM yet because the built-in runtime is not fully installed."
+        "yolobox cannot launch a VM yet because the built-in runtime is not fully installed."
             .to_string(),
     ];
     lines.push(String::new());
@@ -723,25 +723,25 @@ fn missing_vm_runtime_guidance() -> String {
     }
 
     lines.push("Then verify the machine is ready:".to_string());
-    lines.push("  vibebox doctor".to_string());
+    lines.push("  yolobox doctor".to_string());
     lines.push(String::new());
     lines.push("If you only want a host shell instead of a VM:".to_string());
-    lines.push("  vibebox --shell".to_string());
+    lines.push("  yolobox --shell".to_string());
     lines.join("\n")
 }
 
 fn missing_ssh_guidance() -> String {
     [
-        "vibebox needs an SSH keypair to log into the guest automatically.",
+        "yolobox needs an SSH keypair to log into the guest automatically.",
         "",
         "Create one if you do not already have it:",
         "  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519",
         "",
         "Or pass explicit paths:",
-        "  vibebox --ssh-pubkey ~/.ssh/id_ed25519.pub --ssh-private-key ~/.ssh/id_ed25519",
+        "  yolobox --ssh-pubkey ~/.ssh/id_ed25519.pub --ssh-private-key ~/.ssh/id_ed25519",
         "",
         "For a full environment check:",
-        "  vibebox doctor",
+        "  yolobox doctor",
     ]
     .join("\n")
 }
@@ -1050,21 +1050,21 @@ mod tests {
     #[test]
     fn missing_base_guidance_includes_import_example() {
         let guidance = missing_base_guidance();
-        assert!(guidance.contains("vibebox base import --name ubuntu"));
-        assert!(guidance.contains("vibebox --base ubuntu"));
+        assert!(guidance.contains("yolobox base import --name ubuntu"));
+        assert!(guidance.contains("yolobox --base ubuntu"));
     }
 
     #[test]
     fn missing_ssh_guidance_includes_keygen_example() {
         let guidance = missing_ssh_guidance();
         assert!(guidance.contains("ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519"));
-        assert!(guidance.contains("vibebox doctor"));
+        assert!(guidance.contains("yolobox doctor"));
     }
 
     #[test]
     fn missing_vm_runtime_guidance_includes_doctor_hint() {
         let guidance = missing_vm_runtime_guidance();
-        assert!(guidance.contains("vibebox doctor"));
+        assert!(guidance.contains("yolobox doctor"));
     }
 
     #[test]

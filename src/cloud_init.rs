@@ -271,7 +271,7 @@ fn repo_basename(repo: &str) -> String {
         .unwrap_or(trimmed)
         .trim_end_matches(".git");
     if last_segment.is_empty() {
-        "vibebox".to_string()
+        "yolobox".to_string()
     } else {
         last_segment.to_string()
     }
@@ -339,9 +339,9 @@ fn render_user_data_with_init_script(
     let run_init_script = r#"#!/bin/sh
 set -eu
 cd /workspace 2>/dev/null || cd "$HOME"
-if [ ! -f /var/lib/vibebox/init.done ]; then
-  /var/lib/vibebox/init.sh >>/var/log/vibebox-init.log 2>&1
-  sudo touch /var/lib/vibebox/init.done
+if [ ! -f /var/lib/yolobox/init.done ]; then
+  /var/lib/yolobox/init.sh >>/var/log/yolobox-init.log 2>&1
+  sudo touch /var/lib/yolobox/init.done
 fi
 "#;
     let mounts = render_mounts(shares);
@@ -350,7 +350,7 @@ fi
     let common_write_files = render_common_write_files(user);
 
     format!(
-        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nwrite_files:\n{common_write_files}\n  - path: /var/lib/vibebox/init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{init_script_content}\n  - path: /var/lib/vibebox/run-init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{run_init_script_content}\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n",
+        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nwrite_files:\n{common_write_files}\n  - path: /var/lib/yolobox/init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{init_script_content}\n  - path: /var/lib/yolobox/run-init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{run_init_script_content}\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n",
         init_script_content = indent_for_yaml(init_script, 6),
         run_init_script_content = indent_for_yaml(run_init_script, 6),
     )
@@ -399,10 +399,10 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
     }
     if includes_init_script {
         lines.push(format!(
-            "  - [ sh, -lc, \"mkdir -p /var/lib/vibebox && touch /var/log/vibebox-init.log && chown {user}:{user} /var/log/vibebox-init.log\" ]"
+            "  - [ sh, -lc, \"mkdir -p /var/lib/yolobox && touch /var/log/yolobox-init.log && chown {user}:{user} /var/log/yolobox-init.log\" ]"
         ));
         lines.push(format!(
-            "  - [ su, -, {user}, -c, /var/lib/vibebox/run-init.sh ]"
+            "  - [ su, -, {user}, -c, /var/lib/yolobox/run-init.sh ]"
         ));
     }
     lines.push(format!(
@@ -414,7 +414,7 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
 
 fn render_common_write_files(user: &str) -> String {
     format!(
-        "  - path: /etc/security/limits.d/99-vibebox.conf\n    permissions: '0644'\n    owner: root:root\n    content: |\n{}\n",
+        "  - path: /etc/security/limits.d/99-yolobox.conf\n    permissions: '0644'\n    owner: root:root\n    content: |\n{}\n",
         indent_for_yaml(&render_nofile_limits(user), 6)
     )
 }
@@ -515,7 +515,7 @@ mod tests {
         assert!(rendered.contains("rm -f /workspace"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
-        assert!(rendered.contains("path: /etc/security/limits.d/99-vibebox.conf"));
+        assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("* soft nofile 65536"));
         assert!(rendered.contains("workspace, /workspace, virtiofs"));
         assert!(rendered.contains("ln, -sfn, /workspace, /home/vibe/workspace"));
@@ -523,9 +523,9 @@ mod tests {
 
     #[test]
     fn meta_data_contains_instance_and_hostname() {
-        let rendered = render_meta_data("abc123", "vibebox-host");
+        let rendered = render_meta_data("abc123", "yolobox-host");
         assert!(rendered.contains("instance-id: abc123"));
-        assert!(rendered.contains("local-hostname: vibebox-host"));
+        assert!(rendered.contains("local-hostname: yolobox-host"));
     }
 
     #[test]
@@ -542,14 +542,14 @@ mod tests {
             "#!/bin/sh\necho init\n",
         );
         assert!(rendered.contains("write_files:"));
-        assert!(rendered.contains("path: /var/lib/vibebox/init.sh"));
-        assert!(rendered.contains("path: /var/lib/vibebox/run-init.sh"));
-        assert!(rendered.contains("su, -, vibe, -c, /var/lib/vibebox/run-init.sh"));
-        assert!(rendered.contains("touch /var/log/vibebox-init.log"));
-        assert!(rendered.contains("sudo touch /var/lib/vibebox/init.done"));
+        assert!(rendered.contains("path: /var/lib/yolobox/init.sh"));
+        assert!(rendered.contains("path: /var/lib/yolobox/run-init.sh"));
+        assert!(rendered.contains("su, -, vibe, -c, /var/lib/yolobox/run-init.sh"));
+        assert!(rendered.contains("touch /var/log/yolobox-init.log"));
+        assert!(rendered.contains("sudo touch /var/lib/yolobox/init.done"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
-        assert!(rendered.contains("path: /etc/security/limits.d/99-vibebox.conf"));
+        assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
     }
 

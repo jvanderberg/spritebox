@@ -106,7 +106,7 @@ impl Instance {
 }
 
 pub fn app_home() -> Result<PathBuf, String> {
-    if let Ok(path) = env::var("VIBEBOX_HOME") {
+    if let Ok(path) = env::var("YOLOBOX_HOME") {
         return Ok(PathBuf::from(path));
     }
 
@@ -114,7 +114,7 @@ pub fn app_home() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home)
         .join(".local")
         .join("state")
-        .join("vibebox"))
+        .join("yolobox"))
 }
 
 pub fn import_base_image(name: &str, source: &Path) -> Result<BaseImage, String> {
@@ -418,7 +418,7 @@ fn clone_or_copy_file(source: &Path, destination: &Path) -> Result<(), String> {
 
         let err = std::io::Error::last_os_error();
         Err(format!(
-            "clonefile failed for {} -> {}: {err}; vibebox requires APFS clonefile on macOS and will not fall back to a full copy",
+            "clonefile failed for {} -> {}: {err}; yolobox requires APFS clonefile on macOS and will not fall back to a full copy",
             source.display(),
             destination.display()
         ))
@@ -453,7 +453,7 @@ fn mib_to_bytes(size_mib: u64) -> u64 {
 }
 
 fn desired_rootfs_mib(base_image_mib: u64) -> u64 {
-    env::var("VIBEBOX_ROOTFS_MIB")
+    env::var("YOLOBOX_ROOTFS_MIB")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1050,17 +1050,17 @@ mod tests {
 
     #[test]
     fn desired_rootfs_defaults_to_large_sparse_disk() {
-        let saved = env::var("VIBEBOX_ROOTFS_MIB").ok();
+        let saved = env::var("YOLOBOX_ROOTFS_MIB").ok();
         unsafe {
-            env::remove_var("VIBEBOX_ROOTFS_MIB");
+            env::remove_var("YOLOBOX_ROOTFS_MIB");
         }
         assert_eq!(desired_rootfs_mib(2252), 32 * 1024);
         match saved {
             Some(value) => unsafe {
-                env::set_var("VIBEBOX_ROOTFS_MIB", value);
+                env::set_var("YOLOBOX_ROOTFS_MIB", value);
             },
             None => unsafe {
-                env::remove_var("VIBEBOX_ROOTFS_MIB");
+                env::remove_var("YOLOBOX_ROOTFS_MIB");
             },
         }
     }
@@ -1068,22 +1068,22 @@ mod tests {
     #[test]
     fn desired_rootfs_respects_larger_env_override() {
         unsafe {
-            env::set_var("VIBEBOX_ROOTFS_MIB", "65536");
+            env::set_var("YOLOBOX_ROOTFS_MIB", "65536");
         }
         assert_eq!(desired_rootfs_mib(2252), 65536);
         unsafe {
-            env::remove_var("VIBEBOX_ROOTFS_MIB");
+            env::remove_var("YOLOBOX_ROOTFS_MIB");
         }
     }
 
     #[test]
     fn desired_rootfs_never_shrinks_below_base_image() {
         unsafe {
-            env::set_var("VIBEBOX_ROOTFS_MIB", "1024");
+            env::set_var("YOLOBOX_ROOTFS_MIB", "1024");
         }
         assert_eq!(desired_rootfs_mib(4096), 4096);
         unsafe {
-            env::remove_var("VIBEBOX_ROOTFS_MIB");
+            env::remove_var("YOLOBOX_ROOTFS_MIB");
         }
     }
 

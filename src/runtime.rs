@@ -92,7 +92,7 @@ pub fn resolve_runtime(force_shell: bool) -> RuntimePlan {
         };
     }
 
-    if let Some(launcher) = env::var_os("VIBEBOX_VM_LAUNCHER").map(PathBuf::from) {
+    if let Some(launcher) = env::var_os("YOLOBOX_VM_LAUNCHER").map(PathBuf::from) {
         return RuntimePlan {
             mode: LaunchMode::External(launcher),
         };
@@ -118,7 +118,7 @@ pub fn launch(
         LaunchMode::Shell => {
             if config.require_vm {
                 return Err(
-                    "vm runtime requested, but neither VIBEBOX_VM_LAUNCHER nor krunkit is available"
+                    "vm runtime requested, but neither YOLOBOX_VM_LAUNCHER nor krunkit is available"
                         .to_string(),
                 );
             }
@@ -155,7 +155,7 @@ pub fn launch_summary(instance: &Instance, config: &LaunchConfig) -> Vec<String>
         lines.extend(vmnet.summary_lines());
     }
 
-    if let Some(launcher) = env::var_os("VIBEBOX_VM_LAUNCHER") {
+    if let Some(launcher) = env::var_os("YOLOBOX_VM_LAUNCHER") {
         lines.push(format!(
             "vm_launcher: external {}",
             PathBuf::from(launcher).display()
@@ -190,22 +190,22 @@ fn launch_shell(instance: &Instance) -> Result<i32, String> {
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let status = Command::new(shell)
         .current_dir(&instance.checkout_dir)
-        .env("VIBEBOX_INSTANCE", &instance.id)
-        .env("VIBEBOX_CHECKOUT", &instance.checkout_dir)
-        .env("VIBEBOX_BASE_IMAGE", &instance.base_image_path)
-        .env("VIBEBOX_BASE_IMAGE_ID", &instance.base_image_id)
-        .env("VIBEBOX_ROOTFS", &instance.rootfs_path)
-        .env("VIBEBOX_REPO", instance.repo.as_deref().unwrap_or_default())
+        .env("YOLOBOX_INSTANCE", &instance.id)
+        .env("YOLOBOX_CHECKOUT", &instance.checkout_dir)
+        .env("YOLOBOX_BASE_IMAGE", &instance.base_image_path)
+        .env("YOLOBOX_BASE_IMAGE_ID", &instance.base_image_id)
+        .env("YOLOBOX_ROOTFS", &instance.rootfs_path)
+        .env("YOLOBOX_REPO", instance.repo.as_deref().unwrap_or_default())
         .env(
-            "VIBEBOX_BRANCH",
+            "YOLOBOX_BRANCH",
             instance.branch.as_deref().unwrap_or_default(),
         )
-        .env("VIBEBOX_SHARES", encode_env_shares(&instance.shares))
+        .env("YOLOBOX_SHARES", encode_env_shares(&instance.shares))
         .env(
-            "VIBEBOX_GUEST_ENV",
+            "YOLOBOX_GUEST_ENV",
             encode_guest_env_names(&instance.guest_env),
         )
-        .env("VIBEBOX_PORTS", encode_env_ports(&instance.ports))
+        .env("YOLOBOX_PORTS", encode_env_ports(&instance.ports))
         .status()
         .map_err(|err| err.to_string())?;
     Ok(status.code().unwrap_or_default())
@@ -219,21 +219,21 @@ fn launch_external(
     let mut command = Command::new(launcher);
     command
         .current_dir(&instance.checkout_dir)
-        .env("VIBEBOX_INSTANCE", &instance.id)
-        .env("VIBEBOX_REPO", instance.repo.as_deref().unwrap_or_default())
+        .env("YOLOBOX_INSTANCE", &instance.id)
+        .env("YOLOBOX_REPO", instance.repo.as_deref().unwrap_or_default())
         .env(
-            "VIBEBOX_BRANCH",
+            "YOLOBOX_BRANCH",
             instance.branch.as_deref().unwrap_or_default(),
         )
-        .env("VIBEBOX_CHECKOUT", &instance.checkout_dir)
-        .env("VIBEBOX_BASE_IMAGE", &instance.base_image_path)
-        .env("VIBEBOX_BASE_IMAGE_ID", &instance.base_image_id)
-        .env("VIBEBOX_ROOTFS", &instance.rootfs_path)
-        .env("VIBEBOX_ROOTFS_MB", instance.rootfs_mb.to_string())
-        .env("VIBEBOX_CPUS", config.cpus.to_string())
-        .env("VIBEBOX_MEMORY_MIB", config.memory_mib.to_string())
+        .env("YOLOBOX_CHECKOUT", &instance.checkout_dir)
+        .env("YOLOBOX_BASE_IMAGE", &instance.base_image_path)
+        .env("YOLOBOX_BASE_IMAGE_ID", &instance.base_image_id)
+        .env("YOLOBOX_ROOTFS", &instance.rootfs_path)
+        .env("YOLOBOX_ROOTFS_MB", instance.rootfs_mb.to_string())
+        .env("YOLOBOX_CPUS", config.cpus.to_string())
+        .env("YOLOBOX_MEMORY_MIB", config.memory_mib.to_string())
         .env(
-            "VIBEBOX_CLOUD_INIT_IMAGE",
+            "YOLOBOX_CLOUD_INIT_IMAGE",
             config
                 .cloud_init_image
                 .as_ref()
@@ -241,30 +241,30 @@ fn launch_external(
                 .unwrap_or_default(),
         )
         .env(
-            "VIBEBOX_CLOUD_INIT_USER",
+            "YOLOBOX_CLOUD_INIT_USER",
             config.cloud_init_user.as_deref().unwrap_or_default(),
         )
         .env(
-            "VIBEBOX_HOSTNAME",
+            "YOLOBOX_HOSTNAME",
             config.hostname.as_deref().unwrap_or_default(),
         )
-        .env("VIBEBOX_SHARES", encode_env_shares(&config.shares))
+        .env("YOLOBOX_SHARES", encode_env_shares(&config.shares))
         .env(
-            "VIBEBOX_GUEST_ENV",
+            "YOLOBOX_GUEST_ENV",
             encode_guest_env_names(&config.guest_env),
         )
-        .env("VIBEBOX_PORTS", encode_env_ports(&instance.ports));
+        .env("YOLOBOX_PORTS", encode_env_ports(&instance.ports));
 
     if let Some(vmnet) = &config.vmnet {
         command
-            .env("VIBEBOX_GUEST_IP", &vmnet.guest_ip)
-            .env("VIBEBOX_GUEST_GATEWAY", &vmnet.gateway_ip)
-            .env("VIBEBOX_GUEST_MAC", &vmnet.mac_address)
-            .env("VIBEBOX_INTERFACE_ID", &vmnet.interface_id);
+            .env("YOLOBOX_GUEST_IP", &vmnet.guest_ip)
+            .env("YOLOBOX_GUEST_GATEWAY", &vmnet.gateway_ip)
+            .env("YOLOBOX_GUEST_MAC", &vmnet.mac_address)
+            .env("YOLOBOX_INTERFACE_ID", &vmnet.interface_id);
     }
 
     if let Some(path) = &config.ssh_private_key_path {
-        command.env("VIBEBOX_SSH_PRIVATE_KEY", path);
+        command.env("YOLOBOX_SSH_PRIVATE_KEY", path);
     }
 
     let status = command.status().map_err(|err| err.to_string())?;
@@ -609,7 +609,7 @@ fn guest_shell_command(shares: &[ShareMount], guest_env: &[GuestEnvVar], verbose
     let git_identity_sync = " if command -v git >/dev/null 2>&1; then if [ -n \"${GIT_AUTHOR_NAME:-}\" ]; then git config --global user.name \"$GIT_AUTHOR_NAME\" >/dev/null 2>&1 || true; fi; if [ -n \"${GIT_AUTHOR_EMAIL:-}\" ]; then git config --global user.email \"$GIT_AUTHOR_EMAIL\" >/dev/null 2>&1 || true; fi; fi;";
 
     let cloud_init_wait = if verbose {
-        "if command -v cloud-init >/dev/null 2>&1; then CLOUD_INIT_STATUS=\"$(sudo cloud-init status 2>/dev/null || true)\"; if ! printf \"%s\" \"$CLOUD_INIT_STATUS\" | grep -q \"status: done\"; then echo \"waiting for cloud-init/bootstrap...\"; if sudo test -e /var/log/vibebox-init.log; then sudo sh -lc \"tail -n +1 -F /var/log/vibebox-init.log\" & TAIL_PID=$!; fi; sudo cloud-init status --wait >/dev/null 2>&1 || true; if [ -n \"${TAIL_PID:-}\" ]; then kill \"$TAIL_PID\" 2>/dev/null || true; wait \"$TAIL_PID\" 2>/dev/null || true; fi; echo \"cloud-init/bootstrap complete\"; fi; if sudo test -f /var/lib/vibebox/init.done && sudo test -f /var/log/vibebox-init.log && ! sudo test -f /var/lib/vibebox/init-log-shown; then echo \"bootstrap log:\"; sudo cat /var/log/vibebox-init.log; sudo touch /var/lib/vibebox/init-log-shown; fi; fi;"
+        "if command -v cloud-init >/dev/null 2>&1; then CLOUD_INIT_STATUS=\"$(sudo cloud-init status 2>/dev/null || true)\"; if ! printf \"%s\" \"$CLOUD_INIT_STATUS\" | grep -q \"status: done\"; then echo \"waiting for cloud-init/bootstrap...\"; if sudo test -e /var/log/yolobox-init.log; then sudo sh -lc \"tail -n +1 -F /var/log/yolobox-init.log\" & TAIL_PID=$!; fi; sudo cloud-init status --wait >/dev/null 2>&1 || true; if [ -n \"${TAIL_PID:-}\" ]; then kill \"$TAIL_PID\" 2>/dev/null || true; wait \"$TAIL_PID\" 2>/dev/null || true; fi; echo \"cloud-init/bootstrap complete\"; fi; if sudo test -f /var/lib/yolobox/init.done && sudo test -f /var/log/yolobox-init.log && ! sudo test -f /var/lib/yolobox/init-log-shown; then echo \"bootstrap log:\"; sudo cat /var/log/yolobox-init.log; sudo touch /var/lib/yolobox/init-log-shown; fi; fi;"
     } else {
         "if command -v cloud-init >/dev/null 2>&1; then sudo cloud-init status --wait >/dev/null 2>&1 || true; fi;"
     };
@@ -678,7 +678,7 @@ fn probe_ssh(
 }
 
 fn ssh_ready_timeout() -> Duration {
-    env::var("VIBEBOX_SSH_READY_TIMEOUT_SECS")
+    env::var("YOLOBOX_SSH_READY_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1102,7 +1102,7 @@ mod tests {
         );
         assert!(command.contains("cloud-init status --wait"));
         assert!(command.contains("waiting for cloud-init/bootstrap"));
-        assert!(command.contains("/var/log/vibebox-init.log"));
+        assert!(command.contains("/var/log/yolobox-init.log"));
         assert!(command.contains("bootstrap log:"));
         assert!(command.contains("init-log-shown"));
         assert!(command.contains("growpart"));
@@ -1123,7 +1123,7 @@ mod tests {
         assert!(command.contains("cloud-init status --wait >/dev/null 2>&1"));
         assert!(!command.contains("waiting for cloud-init/bootstrap"));
         assert!(!command.contains("bootstrap log:"));
-        assert!(!command.contains("/var/log/vibebox-init.log"));
+        assert!(!command.contains("/var/log/yolobox-init.log"));
     }
 
     #[test]
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn stale_vm_cleanup_tolerates_missing_process() {
-        let pidfile = PathBuf::from("/tmp/vibebox-stale-test.pid");
+        let pidfile = PathBuf::from("/tmp/yolobox-stale-test.pid");
         fs::write(&pidfile, "999999\n").unwrap();
         stop_stale_vm(&pidfile).unwrap();
         assert!(!pidfile.exists());
@@ -1219,7 +1219,7 @@ mod tests {
 
     #[test]
     fn runtime_failure_detection_reports_vmnet_errors() {
-        let log_path = PathBuf::from("/tmp/vibebox-runtime-test.log");
+        let log_path = PathBuf::from("/tmp/yolobox-runtime-test.log");
         fs::write(
             &log_path,
             "ERROR [main] vmnet_start_interface: VMNET_FAILURE\n",
@@ -1236,26 +1236,26 @@ mod tests {
 
     #[test]
     fn ssh_ready_timeout_uses_default_when_unset_or_invalid() {
-        let saved = env::var("VIBEBOX_SSH_READY_TIMEOUT_SECS").ok();
+        let saved = env::var("YOLOBOX_SSH_READY_TIMEOUT_SECS").ok();
         unsafe {
-            env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
+            env::remove_var("YOLOBOX_SSH_READY_TIMEOUT_SECS");
         }
         assert_eq!(ssh_ready_timeout(), Duration::from_secs(300));
 
         unsafe {
-            env::set_var("VIBEBOX_SSH_READY_TIMEOUT_SECS", "nope");
+            env::set_var("YOLOBOX_SSH_READY_TIMEOUT_SECS", "nope");
         }
         assert_eq!(ssh_ready_timeout(), Duration::from_secs(300));
 
         unsafe {
-            env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
+            env::remove_var("YOLOBOX_SSH_READY_TIMEOUT_SECS");
         }
         match saved {
             Some(value) => unsafe {
-                env::set_var("VIBEBOX_SSH_READY_TIMEOUT_SECS", value);
+                env::set_var("YOLOBOX_SSH_READY_TIMEOUT_SECS", value);
             },
             None => unsafe {
-                env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
+                env::remove_var("YOLOBOX_SSH_READY_TIMEOUT_SECS");
             },
         }
     }
@@ -1263,17 +1263,17 @@ mod tests {
     #[test]
     fn ssh_ready_timeout_uses_env_override() {
         unsafe {
-            env::set_var("VIBEBOX_SSH_READY_TIMEOUT_SECS", "45");
+            env::set_var("YOLOBOX_SSH_READY_TIMEOUT_SECS", "45");
         }
         assert_eq!(ssh_ready_timeout(), Duration::from_secs(45));
         unsafe {
-            env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
+            env::remove_var("YOLOBOX_SSH_READY_TIMEOUT_SECS");
         }
     }
 
     #[test]
     fn running_vm_matches_share_config_file() {
-        let path = PathBuf::from("/tmp/vibebox-shares-test");
+        let path = PathBuf::from("/tmp/yolobox-shares-test");
         let shares = vec![ShareMount {
             host_path: PathBuf::from("/tmp/host"),
             guest_path: PathBuf::from("/mnt/guest"),

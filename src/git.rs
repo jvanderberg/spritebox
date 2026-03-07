@@ -174,7 +174,7 @@ fn create_temp_git_dir() -> Result<PathBuf, String> {
             .duration_since(UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_nanos();
-        let path = base.join(format!("vibebox-git-{pid}-{nanos}-{attempt}"));
+        let path = base.join(format!("yolobox-git-{pid}-{nanos}-{attempt}"));
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
