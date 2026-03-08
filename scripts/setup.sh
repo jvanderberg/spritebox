@@ -581,7 +581,7 @@ run_provision_launch() {
     --name "$TEMP_INSTANCE_NAME" \
     --base "$BASE_NAME" \
     --hostname "$TEMP_HOSTNAME" \
-    --cloud-user "$CLOUD_USER" \
+    --user "$CLOUD_USER" \
     --verbose \
     --init-script "$SOURCE_REPO_DIR/scripts/bootstrap-vm.sh" \
     < "$verify_script" &

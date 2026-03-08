@@ -31,20 +31,30 @@ pub fn run() -> Result<(), String> {
 
 #[derive(Debug)]
 enum Command {
+    /// Manage immutable base images used to create instances.
     Base(BaseCommand),
+    /// Create or reopen an instance and optionally enter it.
     Launch(LaunchOptions),
+    /// Show instance metadata and whether the VM is currently running.
     Status(TargetOptions),
+    /// Stop a running VM without deleting its state.
     Stop(TargetOptions),
+    /// Check whether host prerequisites for the built-in VM runtime are installed.
     Doctor,
+    /// List all known instances.
     List,
+    /// Delete an instance and all of its state.
     Destroy(DestroyOptions),
     Help(String),
 }
 
 #[derive(Clone, Debug, Subcommand)]
 enum BaseCommand {
+    /// Import a raw disk image as a named immutable base image.
     Import(BaseImportOptions),
+    /// Capture an instance root disk as a new immutable base image.
     Capture(BaseCaptureOptions),
+    /// List imported base images.
     List,
 }
 
@@ -55,8 +65,10 @@ struct Cli {
 
 #[derive(Clone, Debug, Args)]
 struct BaseImportOptions {
+    /// Name used to refer to the imported base image.
     #[arg(long)]
     name: String,
+    /// Path to a raw disk image file to import.
     #[arg(long)]
     image: PathBuf,
 }
@@ -68,14 +80,19 @@ struct BaseImportOptions {
         .args(["instance", "repo", "base"])
 ))]
 struct BaseCaptureOptions {
+    /// Name for the newly captured base image.
     #[arg(long)]
     name: String,
+    /// Capture from an existing standalone instance by name.
     #[arg(long = "instance", conflicts_with_all = ["repo", "branch", "base"])]
     instance: Option<String>,
+    /// Capture from the instance identified by this repo.
     #[arg(long, requires = "branch", conflicts_with = "base")]
     repo: Option<String>,
+    /// Capture from the instance identified by this branch.
     #[arg(long, requires = "repo")]
     branch: Option<String>,
+    /// Capture from a base-only instance identified by base name.
     #[arg(long, conflicts_with_all = ["instance", "repo", "branch"])]
     base: Option<String>,
 }
@@ -87,58 +104,83 @@ struct BaseCaptureOptions {
         .args(["name", "repo"])
 ))]
 struct LaunchOptions {
+    /// Launch or reopen a standalone instance with this explicit name.
     #[arg(long, conflicts_with_all = ["repo", "branch"])]
     name: Option<String>,
+    /// Git remote URL to clone and keep checked out in the instance.
     #[arg(long, conflicts_with = "name")]
     repo: Option<String>,
+    /// Branch to check out for the instance.
     #[arg(long, requires = "repo")]
     branch: Option<String>,
+    /// Create the branch if it does not already exist on the remote.
     #[arg(long, requires_all = ["repo", "branch"])]
     new_branch: bool,
+    /// Base branch to use with --new-branch. Defaults to the remote's default branch.
     #[arg(long, requires_all = ["repo", "branch"])]
     from: Option<String>,
+    /// Base image to use when creating a new instance.
     #[arg(long)]
     base: Option<String>,
     #[arg(long, hide = true)]
     vm: bool,
+    /// Skip the VM and open a host shell in the checkout directory instead.
     #[arg(long = "shell")]
     shell_only: bool,
+    /// Prepare the instance and exit before launching or attaching to it.
     #[arg(long = "no-enter")]
     no_enter: bool,
+    /// Number of virtual CPUs to allocate to the VM.
     #[arg(long, default_value_t = runtime::default_cpus())]
     cpus: u8,
+    /// Memory to allocate to the VM in MiB.
     #[arg(long = "memory-mib", default_value_t = runtime::default_memory_mib())]
     memory_mib: u32,
+    /// Skip cloud-init guest configuration and use the base image as-is.
     #[arg(long = "no-cloud-init", action = ArgAction::SetFalse, default_value_t = true)]
     cloud_init: bool,
-    #[arg(long = "cloud-user", default_value_t = cloud_init::default_cloud_user())]
+    /// Guest username to create or use when cloud-init is enabled.
+    #[arg(long = "user", default_value_t = cloud_init::default_cloud_user())]
     cloud_user: String,
+    /// Override the guest hostname.
     #[arg(long)]
     hostname: Option<String>,
+    /// Path to the public SSH key to authorize for guest login.
     #[arg(long = "ssh-pubkey")]
     ssh_pubkey: Option<PathBuf>,
+    /// Path to the private SSH key the launcher uses to SSH into the guest; it is not copied into the VM.
     #[arg(long = "ssh-private-key")]
     ssh_private_key: Option<PathBuf>,
+    /// Run this script once inside the guest after first boot.
     #[arg(long = "init-script")]
     init_script: Option<PathBuf>,
+    /// Share a host directory into the guest as <host_path>:<guest_path>.
     #[arg(long = "share", value_parser = state::parse_share)]
     shares: Vec<ShareMount>,
-    #[arg(long = "with-codex")]
+    #[arg(long = "with-codex", hide = true)]
     with_codex: bool,
-    #[arg(long = "with-claude")]
+    #[arg(long = "with-claude", hide = true)]
     with_claude: bool,
-    #[arg(long = "with-gh")]
+    #[arg(long = "with-gh", hide = true)]
     with_gh: bool,
-    #[arg(long = "with-ai")]
+    #[arg(long = "with-ai", hide = true)]
     with_ai: bool,
+    /// Disable Codex integration for this launch.
     #[arg(long = "no-codex", conflicts_with = "with_codex")]
     no_codex: bool,
+    /// Disable Claude integration for this launch.
     #[arg(long = "no-claude", conflicts_with = "with_claude")]
     no_claude: bool,
+    /// Disable GitHub CLI integration for this launch.
     #[arg(long = "no-gh", conflicts_with = "with_gh")]
     no_gh: bool,
+    /// Disable Codex, Claude, and GitHub CLI integrations for this launch.
+    #[arg(long = "no-ai", conflicts_with = "with_ai")]
+    no_ai: bool,
+    /// Print VM launch details and guest bootstrap progress.
     #[arg(long)]
     verbose: bool,
+    /// Replace previously saved manual shares instead of reusing them.
     #[arg(long = "clear-shares")]
     clear_shares: bool,
 }
@@ -150,12 +192,16 @@ struct LaunchOptions {
         .args(["name", "repo", "base"])
 ))]
 struct TargetOptions {
+    /// Target a standalone instance by name.
     #[arg(long, conflicts_with_all = ["repo", "branch", "base"])]
     name: Option<String>,
+    /// Target the instance identified by this repo.
     #[arg(long, requires = "branch", conflicts_with = "base")]
     repo: Option<String>,
+    /// Target the instance identified by this branch.
     #[arg(long, requires = "repo")]
     branch: Option<String>,
+    /// Target a base-only instance identified by base name.
     #[arg(long, conflicts_with_all = ["name", "repo", "branch"])]
     base: Option<String>,
 }
@@ -164,6 +210,7 @@ struct TargetOptions {
 struct DestroyOptions {
     #[command(flatten)]
     target: TargetOptions,
+    /// Skip the interactive confirmation prompt.
     #[arg(long = "yes", short = 'y')]
     yes: bool,
 }
@@ -171,6 +218,7 @@ struct DestroyOptions {
 #[derive(Debug, Parser)]
 #[command(
     name = "yolobox",
+    about = "Launch branch-scoped Linux VMs for local development on macOS",
     disable_help_subcommand = true,
     args_conflicts_with_subcommands = true
 )]
@@ -183,12 +231,19 @@ struct ClapCli {
 
 #[derive(Debug, Subcommand)]
 enum ClapCommand {
+    /// Manage immutable base images used to create instances.
     Base(ClapBaseCommand),
+    /// Create or reopen an instance and optionally enter it.
     Launch(LaunchOptions),
+    /// Show instance metadata and whether the VM is currently running.
     Status(TargetOptions),
+    /// Stop a running VM without deleting its state.
     Stop(TargetOptions),
+    /// Check whether host prerequisites for the built-in VM runtime are installed.
     Doctor,
+    /// List all known instances.
     List,
+    /// Delete an instance and all of its state.
     Destroy(DestroyOptions),
     Help,
 }
@@ -204,7 +259,7 @@ impl Cli {
         let parse_input = std::iter::once("yolobox".to_string())
             .chain(args)
             .collect::<Vec<_>>();
-        let cli = match ClapCli::try_parse_from(parse_input) {
+        let cli = match ClapCli::try_parse_from(parse_input.clone()) {
             Ok(cli) => cli,
             Err(err)
                 if matches!(
@@ -213,7 +268,7 @@ impl Cli {
                 ) =>
             {
                 return Ok(Self {
-                    command: Command::Help(err.to_string()),
+                    command: Command::Help(render_help_for_args(&parse_input)),
                 });
             }
             Err(err) => return Err(err.to_string()),
@@ -752,11 +807,36 @@ fn normalize_launch_options(mut options: LaunchOptions) -> LaunchOptions {
         options.with_claude = true;
         options.with_gh = true;
     }
+    if options.no_ai {
+        options.no_codex = true;
+        options.no_claude = true;
+        options.no_gh = true;
+    }
     options
 }
 
 fn render_help() -> String {
     let mut command = ClapCli::command();
+    let mut output = Vec::new();
+    command
+        .write_long_help(&mut output)
+        .expect("writing clap help should succeed");
+    String::from_utf8(output).expect("clap help should be valid UTF-8")
+}
+
+fn render_help_for_args(args: &[String]) -> String {
+    let mut command = ClapCli::command();
+
+    for arg in args.iter().skip(1) {
+        if arg == "-h" || arg == "--help" {
+            break;
+        }
+        let Some(subcommand) = command.find_subcommand_mut(arg) else {
+            break;
+        };
+        command = subcommand.clone();
+    }
+
     let mut output = Vec::new();
     command
         .write_long_help(&mut output)
@@ -955,11 +1035,11 @@ fn add_optional_or_required_share(
 }
 
 fn codex_share_preference(options: &LaunchOptions) -> SharePreference {
-    share_preference(options.with_codex, options.no_codex)
+    share_preference(options.with_codex, options.no_ai || options.no_codex)
 }
 
 fn claude_share_preference(options: &LaunchOptions) -> SharePreference {
-    share_preference(options.with_claude, options.no_claude)
+    share_preference(options.with_claude, options.no_ai || options.no_claude)
 }
 
 fn share_preference(explicit_enable: bool, explicit_disable: bool) -> SharePreference {
@@ -977,7 +1057,7 @@ fn claude_enabled(options: &LaunchOptions) -> bool {
 }
 
 fn gh_enabled(options: &LaunchOptions) -> bool {
-    !options.no_gh
+    !(options.no_ai || options.no_gh)
 }
 
 fn is_ai_managed_share(share: &ShareMount, cloud_user: &str) -> bool {
@@ -1020,7 +1100,7 @@ mod tests {
     use super::{
         BaseCommand, Cli, Command, SharePreference, claude_share_preference,
         codex_share_preference, confirm_destroy_answer, gh_enabled, missing_base_guidance,
-        missing_ssh_guidance, missing_vm_runtime_guidance,
+        missing_ssh_guidance, missing_vm_runtime_guidance, render_help,
     };
 
     #[test]
@@ -1084,6 +1164,36 @@ mod tests {
             }
             _ => panic!("expected launch command"),
         }
+    }
+
+    #[test]
+    fn no_ai_disables_all_integrations() {
+        let cli = Cli::parse(vec![
+            "--base".to_string(),
+            "ubuntu".to_string(),
+            "--no-ai".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Launch(options) => {
+                assert_eq!(codex_share_preference(&options), SharePreference::Disabled);
+                assert_eq!(claude_share_preference(&options), SharePreference::Disabled);
+                assert!(!gh_enabled(&options));
+            }
+            _ => panic!("expected launch command"),
+        }
+    }
+
+    #[test]
+    fn help_mentions_public_ai_and_launch_flags() {
+        let help = render_help();
+        assert!(help.contains("--no-ai"));
+        assert!(help.contains("--no-codex"));
+        assert!(help.contains("--no-claude"));
+        assert!(help.contains("--no-gh"));
+        assert!(help.contains("--no-enter"));
+        assert!(help.contains("Prepare the instance and exit before launching or attaching to it"));
     }
 
     #[test]

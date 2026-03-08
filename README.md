@@ -1,41 +1,79 @@
 # yolobox
 
-Branch-scoped Micro-VMs for AI safe development on macOS. 
+Use branch-scoped fast-launch micro-VMs for AI-safe development on macOS. 
 Each branch gets its own persistent VM with a writable root disk,
  a shared git checkout, and a stable network identity.
 
 ```bash
-' Launch a new VM
+# Launch a new VM
 yolobox
 
-' Check out a git branch in a new VM
+# Check out a git branch in a new VM
 yolobox --repo git@github.com:org/repo.git --branch main
+
+# Launch a previous checkout by repo-branch
+yolobox --name markless-fix-edit-mode-width
 ```
 
-You're dropped into shell with your repo at `/workspace`, 
+In branch mode, you're dropped into shell with your repo at `/workspace`, 
 your SSH agent forwarded, and network services reachable from the host 
 at `<project>-<branch>.local` (e.g. `repo-main.local`).
 
-New VM creation/boot takes about 15 seconds, subsequent launches take less than a second.
+New VM creation/first-boot takes about 15 seconds, subsequent launches take less than a second.
 
 ## Yolo mode
 
-Claude and Codex are pre-installed in the environment and are set to automatically
-user their respective --dangerously-skip
+Claude and Codex are pre-installed in the guest environment and are set to automatically
+use their respective --dangerously-skip* modes. Just type `claude` or `codex`
 
 ## How It Works
 
-- Import a Linux cloud image once as an immutable **base image**
-- Each launch clones that base (APFS copy-on-write) into a per-instance root disk
-- `cloud-init` configures the guest: user account, SSH key, hostname, mounts
-- `krunkit` boots the VM with `virtio-blk` (root disk) and `virtio-fs` (host directories)
-- `vmnet-helper` gives the guest a real IP on your local network with mDNS (`<hostname>.local`)
+On creation, an immutable root Ubuntu image is cloned using APFS copy-on-write,
+The new image takes almost no extra space on disk, only changes are stored. All changes are persistent
+for the life of the VM, and scoped to only that VM.
 
-Instances are persistent. Relaunching the same repo+branch reuses the existing root disk and checkout.
+krunkit orchestrates the VM, mapping the git repo in using virtio-fs, mounted as /workspace.
+
+vmnet-helper gives the VM an IP on your local network, and avahi-daemon broadcasts a .local domain name using mDNS.
+
+On exit the VM is left running for fast/warm startup on next launch. You can show all instances and their status with 
+
+```bash
+yolobox list
+```
+
+And you can stop running VMs with 
+```bash
+yolobox stop --name repo-main
+```
+
+## Safety
+
+The VM creates a safer sandbox for running agentic AI in 'yolo' mode. But no sandbox is perfect.
+
+The VM can access only its clone of the root fs, the mapped git repo, and any other local shares you map
+with --share. Be careful with the directories you share if you want to limit the blast radius.
+
+The VM has full access to the network, there is no firewall or outbound blocking/filtering.
+
+If you do not turn off AI integrations (--no-ai), your GitHub credentials will be shared with the VM,
+ ~/.codex and ~/.claude will be mapped into the VM as filesystem shares, and the respective environmental keys 
+will be shared.
+This is no different than the access codex or claude would have if you ran them locally, but remember they will
+both be running in 'yolo' mode, so they have fewer guardrails and checks on what they do. You won't get prompted
+before codex stores your API key in a file and pushes it to the repo.
+
+### SSH Keys
+
+The path to your public key is used to copy that public key into the guest as an authorized key.
+The SSH agent is forwarded into the guest to support outbound SSH.
+
+The path to your private key is used only by the host-side launcher when it SSHes into the guest.
+That private key is not copied into the VM in any way.
 
 ## Install
 
-The recommended path is the installer script.
+The recommended installation path is the installer script.
 
 Run it directly from GitHub:
 
@@ -57,7 +95,7 @@ The installer:
 - builds and installs `yolobox`
 - downloads the Ubuntu cloud image
 - imports a clean `ubuntu` base
-- provisions and captures an `ubuntu-dev` base
+- installs common dev tools and snapshots an `ubuntu-dev` base
 
 Check readiness afterward:
 
@@ -90,9 +128,12 @@ Launch a standalone VM (no git checkout):
 ```bash
 yolobox --base ubuntu
 yolobox --name tools-box --base ubuntu    # with an explicit name
+# name auto-assigned, default base
+yolobox
 ```
 
-The guest hostname defaults to `<project>-<branch>` for git-backed instances (e.g. `myrepo-main`). Unnamed standalone instances get a random petname instead.
+The guest hostname defaults to `<project>-<branch>.local` for git-backed instances (e.g. `myrepo-main.local`). 
+Unnamed standalone instances get a random petname instead.
 
 Create a new branch:
 
@@ -123,17 +164,16 @@ Shares are persisted with the instance -- later launches reuse them automaticall
 
 AI integrations are enabled by default. On launch, yolobox will try to share the host config directories for Codex, Claude, and GitHub into the guest when they exist.
 
-| Flag | What it shares |
-|------|---------------|
-| `--with-ai` | Compatibility flag for the default behavior |
-| `--with-claude` | Require `~/.claude` to be shared and export `ANTHROPIC_API_KEY` |
-| `--with-codex` | Require `~/.codex` to be shared |
-| `--with-gh` | Share `~/.config/gh` when present and export `GH_TOKEN` from `gh auth token` |
-| `--no-claude` | Disable Claude integration for this launch |
-| `--no-codex` | Disable Codex integration for this launch |
-| `--no-gh` | Disable GitHub CLI integration for this launch |
 
-These are `virtio-fs` mounts, so they persist like any other share. yolobox also installs a profile script in the guest that makes `claude` run with `--dangerously-skip-permissions` and `codex` run with `--dangerously-bypass-approvals-and-sandbox` by default. Use `command claude ...` or `command codex ...` if you want the raw CLI behavior in a shell.
+Claude: shares `~/.claude` and exports `ANTHROPIC_API_KEY`
+Codex: shares `~/.codex`
+GitHub: shares `~/.config/gh` and exports `GH_TOKEN` 
+
+`--no-ai` disables this behavior. You can independently disable integrations with `--no-claude`, `--no-codex`, and `--no-gh`.
+
+These are `virtio-fs` mounts, so they persist like any other share. 
+
+yolobox also installs a profile script in the guest that makes `claude` run with `--dangerously-skip-permissions` and `codex` run with `--dangerously-bypass-approvals-and-sandbox` by default. Use `command claude ...` or `command codex ...` if you want the raw CLI behavior in a shell.
 
 ### Init Scripts
 
@@ -147,20 +187,13 @@ The script runs once as the guest user (with `sudo` available), and its output g
 
 ### Cloud-Init Overrides
 
-```bash
-yolobox --repo git@github.com:org/repo.git --branch main \
-  --cloud-user josh \
-  --hostname my-vm \
-  --ssh-pubkey ~/.ssh/id_ed25519.pub \
-  --ssh-private-key ~/.ssh/id_ed25519
-```
-
 Disable cloud-init entirely with `--no-cloud-init` if your base image is already configured.
 
 ### Managing Instances
 
 ```bash
-yolobox list                                            # all instances and their state
+# all instances and their state
+yolobox list                                           
 yolobox status --repo git@github.com:org/repo.git --branch main
 yolobox stop   --repo git@github.com:org/repo.git --branch main   # shut down VM, keep data
 yolobox destroy --repo git@github.com:org/repo.git --branch main  # remove everything
