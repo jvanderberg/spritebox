@@ -565,8 +565,47 @@ destroy_temp_instance_if_present() {
 verify_guest_tools() {
   cat <<'EOF'
 set -euo pipefail
+
+verify_cmd() {
+  local cmd=$1
+  local resolved output version_line
+
+  echo "[verify] checking $cmd"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "[verify] ERROR: $cmd is not on PATH" >&2
+    exit 1
+  }
+
+  resolved="$(readlink -f "$(type -P "$cmd")")"
+  if [[ -z "$resolved" || ! -s "$resolved" ]]; then
+    echo "[verify] ERROR: $cmd resolved to an invalid or empty file: $resolved" >&2
+    exit 1
+  fi
+
+  output="$(command "$cmd" --version 2>&1)" || {
+    echo "[verify] ERROR: $cmd --version failed" >&2
+    exit 1
+  }
+  if [[ -z "$output" ]]; then
+    echo "[verify] ERROR: $cmd --version produced no output" >&2
+    exit 1
+  fi
+
+  version_line="$(printf '%s\n' "$output" | awk 'NF { line=$0 } END { print line }')"
+  if [[ -z "$version_line" ]]; then
+    echo "[verify] ERROR: $cmd --version did not produce a usable version line" >&2
+    exit 1
+  fi
+
+  echo "[verify] $cmd ok: $version_line"
+}
+
 for cmd in rustc cargo node npm codex claude gh python3 pipx; do
+  echo "[verify] checking $cmd on PATH"
   command -v "$cmd" >/dev/null 2>&1
+done
+for cmd in node npm codex claude; do
+  verify_cmd "$cmd"
 done
 exit
 EOF
@@ -617,7 +656,9 @@ prepare_dev_base() {
     "Provision dev base instance: $TEMP_INSTANCE_NAME" \
     "This boots a temporary VM, runs scripts/bootstrap-vm.sh inside it, verifies tools, then captures ubuntu-dev."
   explain "You should see SSH wait progress and cloud-init/bootstrap output after this point."
-  run_provision_launch
+  if ! run_provision_launch; then
+    die "dev base provisioning failed; see bootstrap and [verify] output above"
+  fi
 
   step "Capture dev base image: $DEV_BASE_NAME"
   explain "This snapshots the prepared temporary VM into a reusable immutable base image."
