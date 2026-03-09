@@ -471,6 +471,11 @@ fn render_ai_shell_defaults() -> String {
 codex() {
   command codex --dangerously-bypass-approvals-and-sandbox "$@"
 }
+
+case ":${PATH:-}:" in
+  *:/yolobox/scripts:*) ;;
+  *) export PATH="/yolobox/scripts:${PATH:-}" ;;
+esac
 "#
     .to_string()
 }
@@ -571,6 +576,7 @@ mod tests {
         assert!(rendered.contains("* soft nofile 65536"));
         assert!(rendered.contains("command claude --dangerously-skip-permissions"));
         assert!(rendered.contains("command codex --dangerously-bypass-approvals-and-sandbox"));
+        assert!(rendered.contains("export PATH=\"/yolobox/scripts:${PATH:-}\""));
         assert!(rendered.contains("workspace, /workspace, virtiofs"));
         assert!(rendered.contains("yolobox-requests, \"/yolobox/requests\", virtiofs"));
         assert!(rendered.contains("yolobox-responses, \"/yolobox/responses\", virtiofs, \"ro,defaults,nofail\""));
@@ -608,6 +614,7 @@ mod tests {
         assert!(rendered.contains("mkdir -p /home/vibe && chown vibe:vibe /home/vibe"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
+        assert!(rendered.contains("export PATH=\"/yolobox/scripts:${PATH:-}\""));
         assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
     }
 

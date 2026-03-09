@@ -785,6 +785,9 @@ fn guest_bootstrap_body(
         .iter()
         .map(|var| format!(" export {}={};", var.name, shell_quote(&var.value)))
         .collect::<String>();
+    let bridge_path_export =
+        " case \":${PATH:-}:\" in *:/yolobox/scripts:*) ;; *) export PATH=\"/yolobox/scripts:${PATH:-}\" ;; esac;";
+    let bridge_command_shims = " sudo mkdir -p /usr/local/bin; for tool in yolobox-open yolobox-open-url yolobox-paste-image code finder; do bridge_tool=\"/yolobox/scripts/$tool\"; shim_path=\"/usr/local/bin/$tool\"; if [ -x \"$bridge_tool\" ]; then if [ -L \"$shim_path\" ] || [ ! -e \"$shim_path\" ]; then sudo ln -sfn \"$bridge_tool\" \"$shim_path\"; fi; fi; done;";
     let title_setup = if interactive {
         format!(" printf '\\033]0;%s\\007' {};", shell_quote(instance_id))
     } else {
@@ -799,8 +802,10 @@ fn guest_bootstrap_body(
     };
 
     format!(
-        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi; if [ -e /yolobox ] && [ ! -d /yolobox ]; then sudo rm -f /yolobox; fi; sudo mkdir -p /yolobox;{bridge_mounts}{share_mounts}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\";",
+        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi; if [ -e /yolobox ] && [ ! -d /yolobox ]; then sudo rm -f /yolobox; fi; sudo mkdir -p /yolobox;{bridge_mounts}{share_mounts}{bridge_command_shims}{bridge_path_export}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\";",
         bridge_mounts = bridge_mounts,
+        bridge_command_shims = bridge_command_shims,
+        bridge_path_export = bridge_path_export,
         nofile_limit = GUEST_NOFILE_LIMIT,
         title_setup = title_setup,
         workspace_path = GUEST_WORKSPACE_PATH,
@@ -1326,6 +1331,7 @@ mod tests {
         assert!(command.contains("/yolobox/requests"));
         assert!(command.contains("yolobox-responses"));
         assert!(command.contains("/yolobox/responses"));
+        assert!(command.contains("export PATH=\"/yolobox/scripts:${PATH:-}\""));
         assert!(command.contains(&format!("mount -t virtiofs {}", share_tag(0))));
         assert!(command.contains("/mnt/share"));
         assert!(command.contains("export ANTHROPIC_API_KEY="));

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 const REQUEST_POLL_MILLIS: u64 = 250;
 const GUEST_BRIDGE_ROOT: &str = "/yolobox";
+const GUEST_WORKSPACE_ROOT: &str = "/workspace";
 const GUEST_REQUESTS_ROOT: &str = "/yolobox/requests";
 const GUEST_INPUTS_ROOT: &str = "/yolobox/inputs";
 const GUEST_RESPONSES_ROOT: &str = "/yolobox/responses";
@@ -50,6 +51,8 @@ pub struct ManagedMountSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestVerb {
     Open,
+    Code,
+    Finder,
     OpenUrl,
     PasteImage,
 }
@@ -183,6 +186,11 @@ fn populate_scripts(scripts_dir: &Path) -> Result<(), String> {
         &scripts_dir.join("yolobox-open-url"),
         &render_bridge_tool_script("open-url"),
     )?;
+    write_executable_script(&scripts_dir.join("code"), &render_bridge_tool_script("code"))?;
+    write_executable_script(
+        &scripts_dir.join("finder"),
+        &render_bridge_tool_script("finder"),
+    )?;
     Ok(())
 }
 
@@ -270,6 +278,8 @@ You are running inside a Linux guest launched by `yolobox` on a macOS host.\n\n\
 - Host bridge scripts live under `{scripts_root}`.\n\
 - Environment skills are available under `{skills_root}`.\n\
 - Use `{scripts_root}/yolobox-open <path>` to request opening a host-visible artifact.\n\
+- Use `{scripts_root}/code [path]` to open a shared host-backed directory in VS Code. With no path, it uses the current directory. This works for `/workspace`, `/yolobox`, and explicit shared mounts.\n\
+- Use `{scripts_root}/finder [path]` to open a shared host-backed directory in Finder. With no path, it uses the current directory. This works for `/workspace`, `/yolobox`, and explicit shared mounts.\n\
 - Use `{scripts_root}/yolobox-open-url <http://instance.local:port/...>` to request opening an mDNS URL on the host.\n\
 - Use `{scripts_root}/yolobox-paste-image <path>` to request importing the current host clipboard image.\n\
 - Do not use `open`, `xdg-open`, `pbpaste`, `xclip`, or other GUI/clipboard tools to reach the host directly.\n\
@@ -294,6 +304,8 @@ fn render_agent_skill(agent_name: &str) -> String {
         "# yolobox for {agent_name}\n\n\
 When you need the host to do something, prefer the narrow `yolobox-tools` commands over generic Linux desktop commands.\n\n\
 - For host-visible artifacts: `/yolobox/scripts/yolobox-open /workspace/.artifacts/...`\n\
+- For shared directories in VS Code: `/yolobox/scripts/code [path]` for `/workspace`, `/yolobox`, or an explicit shared mount\n\
+- For shared directories in Finder: `/yolobox/scripts/finder [path]` for `/workspace`, `/yolobox`, or an explicit shared mount\n\
 - For guest services on the host browser: `/yolobox/scripts/yolobox-open-url http://<instance>.local:<port>`\n\
 - For host clipboard image import: `/yolobox/scripts/yolobox-paste-image /yolobox/inputs/<name>.png`\n\
 - For dev servers, give the user an mDNS URL like `http://<instance>.local:<port>` instead of `http://localhost:<port>`\n"
@@ -303,11 +315,18 @@ When you need the host to do something, prefer the narrow `yolobox-tools` comman
 fn render_bridge_tool_script(verb: &str) -> String {
     let usage = if verb == "open-url" {
         format!("usage: yolobox-{verb} <http://instance.local:port/...>")
+    } else if verb == "code" || verb == "finder" {
+        format!("usage: {verb} [directory]")
     } else {
         format!("usage: yolobox-{verb} <absolute-path>")
     };
-    let target_validation = if verb == "open-url" {
-        r#"case "$target" in
+    let (arg_check, target_setup) = if verb == "open-url" {
+        (
+            format!(
+                "if [ \"$#\" -ne 1 ]; then\n  echo \"{usage}\" >&2\n  exit 2\nfi"
+            ),
+            r#"target="$1"
+case "$target" in
   http://*|https://*) ;;
   *)
     echo "url must start with http:// or https://" >&2
@@ -315,8 +334,37 @@ fn render_bridge_tool_script(verb: &str) -> String {
     ;;
 esac
 "#
+            .to_string(),
+        )
+    } else if verb == "code" || verb == "finder" {
+        (
+            format!(
+                "if [ \"$#\" -gt 1 ]; then\n  echo \"{usage}\" >&2\n  exit 2\nfi"
+            ),
+            r#"if [ "$#" -eq 0 ]; then
+  target="$(pwd -P)"
+else
+  input="$1"
+  case "$input" in
+    /*) candidate="$input" ;;
+    *) candidate="$(pwd -P)/$input" ;;
+  esac
+  if [ ! -d "$candidate" ]; then
+    echo "directory not found: $input" >&2
+    exit 2
+  fi
+  target="$(cd "$candidate" && pwd -P)"
+fi
+"#
+            .to_string(),
+        )
     } else {
-        r#"case "$target" in
+        (
+            format!(
+                "if [ \"$#\" -ne 1 ]; then\n  echo \"{usage}\" >&2\n  exit 2\nfi"
+            ),
+            r#"target="$1"
+case "$target" in
   /*) ;;
   *)
     echo "path must be absolute" >&2
@@ -324,19 +372,16 @@ esac
     ;;
 esac
 "#
+            .to_string(),
+        )
     };
     let field_name = if verb == "open-url" { "url" } else { "path" };
     format!(
         r#"#!/bin/sh
 set -eu
 
-if [ "$#" -ne 1 ]; then
-  echo "{usage}" >&2
-  exit 2
-fi
-
-target="$1"
-{target_validation}
+{arg_check}
+{target_setup}
 
 bridge_root="{bridge_root}"
 requests_dir="$bridge_root/requests"
@@ -380,8 +425,8 @@ echo "timed out waiting for host bridge response" >&2
 exit 1
 "#,
         tool = verb,
-        usage = usage,
-        target_validation = target_validation,
+        arg_check = arg_check,
+        target_setup = target_setup,
         field_name = field_name,
         verb = verb,
         bridge_root = GUEST_BRIDGE_ROOT,
@@ -446,6 +491,8 @@ fn load_request(path: &Path) -> Result<Request, String> {
             "verb" => {
                 verb = Some(match value {
                     "open" => RequestVerb::Open,
+                    "code" => RequestVerb::Code,
+                    "finder" => RequestVerb::Finder,
                     "open-url" => RequestVerb::OpenUrl,
                     "paste-image" => RequestVerb::PasteImage,
                     other => return Err(format!("unsupported host bridge verb {other}")),
@@ -459,7 +506,7 @@ fn load_request(path: &Path) -> Result<Request, String> {
 
     let verb = verb.ok_or_else(|| format!("request {} is missing verb", path.display()))?;
     let target = match verb {
-        RequestVerb::Open | RequestVerb::PasteImage => {
+        RequestVerb::Open | RequestVerb::Code | RequestVerb::Finder | RequestVerb::PasteImage => {
             let guest_path =
                 path_target.ok_or_else(|| format!("request {} is missing path", path.display()))?;
             if !Path::new(&guest_path).is_absolute() {
@@ -482,6 +529,8 @@ fn load_request(path: &Path) -> Result<Request, String> {
 fn handle_request(instance: &Instance, request: &Request) -> Response {
     match request.verb {
         RequestVerb::Open => handle_open_request(instance, Path::new(&request.target)),
+        RequestVerb::Code => handle_code_request(instance, Path::new(&request.target)),
+        RequestVerb::Finder => handle_finder_request(instance, Path::new(&request.target)),
         RequestVerb::OpenUrl => handle_open_url_request(&request.target),
         RequestVerb::PasteImage => handle_paste_image_request(instance, Path::new(&request.target)),
     }
@@ -489,6 +538,34 @@ fn handle_request(instance: &Instance, request: &Request) -> Response {
 
 fn handle_open_request(instance: &Instance, guest_path: &Path) -> Response {
     match validate_open_target(instance, guest_path).and_then(open_on_host) {
+        Ok(host_path) => Response {
+            ok: true,
+            message: format!("opened {}", host_path.display()),
+        },
+        Err(err) => Response {
+            ok: false,
+            message: err,
+        },
+    }
+}
+
+fn handle_code_request(instance: &Instance, guest_path: &Path) -> Response {
+    match validate_shared_directory_target(instance, guest_path)
+        .and_then(|host_path| open_code_on_host(instance, host_path))
+    {
+        Ok(host_path) => Response {
+            ok: true,
+            message: format!("opened {}", host_path.display()),
+        },
+        Err(err) => Response {
+            ok: false,
+            message: err,
+        },
+    }
+}
+
+fn handle_finder_request(instance: &Instance, guest_path: &Path) -> Response {
+    match validate_shared_directory_target(instance, guest_path).and_then(open_in_finder_on_host) {
         Ok(host_path) => Response {
             ok: true,
             message: format!("opened {}", host_path.display()),
@@ -601,6 +678,21 @@ fn validate_paste_destination(instance: &Instance, guest_path: &Path) -> Result<
     Ok(host_path)
 }
 
+fn validate_shared_directory_target(instance: &Instance, guest_path: &Path) -> Result<PathBuf, String> {
+    let (host_root, host_path) = map_shared_directory_guest_path(instance, guest_path)?;
+    let canonical_root = fs::canonicalize(&host_root)
+        .map_err(|err| format!("failed to resolve {}: {err}", host_root.display()))?;
+    let canonical_target = fs::canonicalize(&host_path)
+        .map_err(|err| format!("failed to resolve {}: {err}", host_path.display()))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(format!("{} escapes the allowed root", guest_path.display()));
+    }
+    if !canonical_target.is_dir() {
+        return Err(format!("{} is not a directory", guest_path.display()));
+    }
+    Ok(canonical_target)
+}
+
 fn ensure_descendant_directory(root: &Path, path: &Path) -> Result<(), String> {
     let relative = path
         .strip_prefix(root)
@@ -661,8 +753,40 @@ fn map_allowlisted_guest_path(
     Err(format!("{} is not in an allowlisted host bridge path", guest_path.display()))
 }
 
+fn map_shared_directory_guest_path(
+    instance: &Instance,
+    guest_path: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let mut mappings = vec![
+        (PathBuf::from(GUEST_WORKSPACE_ROOT), instance.checkout_dir.clone()),
+        (PathBuf::from(GUEST_BRIDGE_ROOT), host_bridge_dir(instance)),
+    ];
+    mappings.extend(
+        instance
+            .shares
+            .iter()
+            .map(|share| (share.guest_path.clone(), share.host_path.clone())),
+    );
+    mappings.sort_by(|left, right| {
+        right.0.components().count().cmp(&left.0.components().count())
+    });
+
+    for (guest_root, host_root) in mappings {
+        if let Ok(relative) = guest_path.strip_prefix(&guest_root) {
+            return Ok((host_root.clone(), host_root.join(relative)));
+        }
+    }
+
+    Err(format!(
+        "{} is not inside a shared host-backed directory",
+        guest_path.display()
+    ))
+}
+
 fn open_on_host(path: PathBuf) -> Result<PathBuf, String> {
-    let status = Command::new("open")
+    let mut command = Command::new("open");
+    prepare_host_gui_command(&mut command);
+    let status = command
         .arg(&path)
         .status()
         .map_err(|err| format!("failed to launch macOS open for {}: {err}", path.display()))?;
@@ -673,8 +797,62 @@ fn open_on_host(path: PathBuf) -> Result<PathBuf, String> {
     }
 }
 
-fn open_url_on_host(url: String) -> Result<String, String> {
+fn open_code_on_host(_instance: &Instance, path: PathBuf) -> Result<PathBuf, String> {
     let status = Command::new("open")
+        .arg("-a")
+        .arg("Visual Studio Code")
+        .arg(&path)
+        .arg("--args")
+        .arg("--disable-workspace-trust")
+        .status()
+        .map_err(|err| format!("failed to launch VS Code for {}: {err}", path.display()))?;
+    if status.success() {
+        Ok(path)
+    } else {
+        Err(format!("VS Code open failed for {}", path.display()))
+    }
+}
+
+fn prepare_host_gui_command(command: &mut Command) {
+    command.env_clear();
+    copy_env_if_present(command, "HOME");
+    copy_env_if_present(command, "PATH");
+    copy_env_if_present(command, "TMPDIR");
+    copy_env_if_present(command, "LANG");
+    copy_env_if_present(command, "LC_ALL");
+    copy_env_if_present(command, "USER");
+    copy_env_if_present(command, "LOGNAME");
+    copy_env_if_present(command, "SHELL");
+    copy_env_if_present(command, "SSH_AUTH_SOCK");
+    if let Ok(home) = std::env::var("HOME") {
+        command.current_dir(home);
+    }
+}
+
+fn copy_env_if_present(command: &mut Command, key: &str) {
+    if let Some(value) = std::env::var_os(key) {
+        command.env(key, value);
+    }
+}
+
+fn open_in_finder_on_host(path: PathBuf) -> Result<PathBuf, String> {
+    let mut command = Command::new("open");
+    prepare_host_gui_command(&mut command);
+    let status = command
+        .arg(&path)
+        .status()
+        .map_err(|err| format!("failed to launch Finder for {}: {err}", path.display()))?;
+    if status.success() {
+        Ok(path)
+    } else {
+        Err(format!("Finder open failed for {}", path.display()))
+    }
+}
+
+fn open_url_on_host(url: String) -> Result<String, String> {
+    let mut command = Command::new("open");
+    prepare_host_gui_command(&mut command);
+    let status = command
         .arg(&url)
         .status()
         .map_err(|err| format!("failed to launch macOS open for {url}: {err}"))?;
@@ -796,10 +974,11 @@ mod tests {
         GUEST_ARTIFACTS_ROOT, GUEST_INPUTS_ROOT, GUEST_REQUESTS_ROOT, GUEST_RESPONSES_ROOT,
         GUEST_SCRIPTS_ROOT, GUEST_SKILLS_ROOT, Response, canonical_root_for_guest,
         managed_mount_specs, managed_mounts, map_allowlisted_guest_path, render_bridge_tool_script,
-        validate_mdns_url, validate_paste_destination, write_response,
+        validate_mdns_url, validate_paste_destination, validate_shared_directory_target,
+        write_response,
     };
     use crate::ports::PortMapping;
-    use crate::state::Instance;
+    use crate::state::{Instance, ShareMount};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -836,6 +1015,8 @@ mod tests {
         assert!(root.join("instance/runtime/yolobox/requests").is_dir());
         assert!(root.join("instance/runtime/yolobox/responses").is_dir());
         assert!(root.join("instance/runtime/yolobox/inputs").is_dir());
+        assert!(root.join("instance/runtime/yolobox/scripts").join("code").is_file());
+        assert!(root.join("instance/runtime/yolobox/scripts").join("finder").is_file());
         assert!(root.join("instance/runtime/yolobox/scripts").join("yolobox-open").is_file());
         assert!(root.join("instance/runtime/yolobox/scripts").join("yolobox-open-url").is_file());
         assert!(root.join("instance/runtime/yolobox/scripts").join("yolobox-paste-image").is_file());
@@ -901,6 +1082,16 @@ mod tests {
         assert!(script.contains("usage: yolobox-open-url <http://instance.local:port/...>"));
         assert!(script.contains("url must start with http:// or https://"));
         assert!(script.contains("url=%s"));
+    }
+
+    #[test]
+    fn code_script_defaults_to_pwd_and_accepts_optional_directory() {
+        let script = render_bridge_tool_script("code");
+        assert!(script.contains("usage: code [directory]"));
+        assert!(script.contains("if [ \"$#\" -gt 1 ]; then"));
+        assert!(script.contains("target=\"$(pwd -P)\""));
+        assert!(script.contains("target=\"$(cd \"$candidate\" && pwd -P)\""));
+        assert!(script.contains("path=%s"));
     }
 
     #[test]
@@ -983,5 +1174,38 @@ mod tests {
         assert!(validate_mdns_url("http://example.com").is_err());
         assert!(validate_mdns_url("ftp://demo.local/file").is_err());
         assert!(validate_mdns_url("http://user@demo.local").is_err());
+    }
+
+    #[test]
+    fn shared_directory_validation_allows_workspace_bridge_and_manual_shares() {
+        let root = PathBuf::from("/tmp/yolobox-host-bridge-directory-test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("instance").join("runtime")).unwrap();
+        fs::create_dir_all(root.join("checkout").join("docs")).unwrap();
+        fs::create_dir_all(root.join("manual-share").join("nested")).unwrap();
+        let mut instance = sample_instance(&root);
+        instance.shares.push(ShareMount {
+            host_path: root.join("manual-share"),
+            guest_path: PathBuf::from("/mnt/manual"),
+        });
+        managed_mounts(&instance, None).unwrap();
+
+        assert!(
+            validate_shared_directory_target(&instance, Path::new("/workspace/docs"))
+                .unwrap()
+                .ends_with("checkout/docs")
+        );
+        assert!(
+            validate_shared_directory_target(&instance, Path::new("/yolobox/skills"))
+                .unwrap()
+                .ends_with("runtime/yolobox/skills")
+        );
+        assert!(
+            validate_shared_directory_target(&instance, Path::new("/mnt/manual/nested"))
+                .unwrap()
+                .ends_with("manual-share/nested")
+        );
+        assert!(validate_shared_directory_target(&instance, Path::new("/etc")).is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 }

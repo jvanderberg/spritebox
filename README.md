@@ -1,8 +1,10 @@
 # yolobox
 
-Use branch-scoped fast-launch micro-VMs for AI-safe development on macOS. 
+Use branch scoped, fast micro VMs for AI-safe development on macOS. 
 Each branch gets its own persistent VM with a writable root disk,
  a shared git checkout, and a stable network identity.
+
+yolobox is focused on sensible defaults, low config, and high quality MacOS host integrations.
 
 ```bash
 # Launch a new VM
@@ -33,7 +35,6 @@ The new image takes almost no extra space on disk, only changes are stored. All 
 for the life of the VM, and scoped to only that VM.
 
 krunkit orchestrates the VM, mapping the git repo in using virtio-fs, mounted as /workspace.
-It also mounts a per-instance control and integration directory at /yolobox.
 
 vmnet-helper gives the VM an IP on your local network, and avahi-daemon broadcasts a .local domain name using mDNS.
 
@@ -50,7 +51,7 @@ yolobox stop --name repo-main
 
 ## Safety
 
-The VM creates a safer sandbox for running agentic AI in 'yolo' mode. But no sandbox is perfect.
+The VM creates a safer sandbox for running agentic AI in 'yolo' mode. I say 'safer' because no sandbox is perfect.
 
 The VM can access only its clone of the root fs, the mapped git repo, and any other local shares you map
 with --share. Be careful with the directories you share if you want to limit the blast radius.
@@ -63,6 +64,12 @@ will be shared.
 This is no different than the access codex or claude would have if you ran them locally, but remember they will
 both be running in 'yolo' mode, so they have fewer guardrails and checks on what they do. You won't get prompted
 before codex stores your API key in a file and pushes it to the repo.
+
+The host bridge helpers give the VM access to host services with security resrictions. The VM can request a copy of the host's clipboard, with user confirmation only. The VM can request the host open allowlisted file types. This is restricted to media formats and html. The VM can request that the host open URLs pointing to local VM services only.
+
+And finally, the VM can ask the host to open shared directories in VS Code or Finder, but only for directories that map back to host-backed virtio-fs shares such as `/workspace`, `/yolobox`, or an explicit `--share`.
+
+The host bridge helpers communicate using files on the virtiofs share mounted at /yolobox.
 
 ### SSH Keys
 
@@ -161,20 +168,21 @@ yolobox --repo git@github.com:org/repo.git --branch main \
 
 Shares are persisted with the instance -- later launches reuse them automatically. If you change the share set on a running VM, yolobox restarts it to apply the new mounts. Clear saved shares with `--clear-shares`.
 
-### AI and Dev Tool Integration
+### AI Integration
 
 AI integrations are enabled by default. On launch, yolobox will try to share the host config directories for Codex, Claude, and GitHub into the guest when they exist.
 
 
-Claude: shares `~/.claude` and exports `ANTHROPIC_API_KEY`
-Codex: shares `~/.codex`
-GitHub: shares `~/.config/gh` and exports `GH_TOKEN` 
+- Claude: shares `~/.claude` and exports `ANTHROPIC_API_KEY`
+- Codex: shares `~/.codex`
+- GitHub: shares `~/.config/gh` and exports `GH_TOKEN` 
 
 `--no-ai` disables this behavior. You can independently disable integrations with `--no-claude`, `--no-codex`, and `--no-gh`.
 
 These are `virtio-fs` mounts, so they persist like any other share. 
 
 yolobox also installs a profile script in the guest that makes `claude` run with `--dangerously-skip-permissions` and `codex` run with `--dangerously-bypass-approvals-and-sandbox` by default. Use `command claude ...` or `command codex ...` if you want the raw CLI behavior in a shell.
+
 
 Shared skills and host-bridge guidance are also populated under `/yolobox/skills`.
 Bridge helper scripts are populated under `/yolobox/scripts`.
@@ -183,17 +191,8 @@ When using an agent inside the guest, tell it to read the relevant files under `
 
 ```text
 You are running inside yolobox on a macOS host.
-Before you begin, read the relevant guidance under /yolobox/skills/common and /yolobox/skills/<agent>.
-Follow the yolobox host-bridge instructions there for opening artifacts, importing clipboard images, and telling me how to access guest services from the host.
+Before you begin, read the relevant guidance under /yolobox.
 ```
-
-The default skills cover two main areas:
-
-`/yolobox/skills/common/yolobox.md`
-Explains the yolobox environment boundary: `/workspace` vs `/yolobox`, host-visible artifact paths, clipboard-import paths, the host bridge scripts, and the fact that host users must access guest services via the instance `.local` hostname instead of guest `localhost`.
-
-`/yolobox/skills/<agent>/yolobox.md`
-Provides agent-specific usage guidance for the same environment. Right now the Codex and Claude variants both tell the agent to use `/yolobox/scripts/yolobox-open` for host-visible artifacts, `/yolobox/scripts/yolobox-paste-image` for clipboard image import, and mDNS URLs like `http://<instance>.local:<port>` for guest services.
 
 ### Host Bridge Helpers
 
@@ -205,7 +204,24 @@ Requests that the macOS host open an allowlisted artifact file.
 `/yolobox/scripts/yolobox-paste-image /yolobox/inputs/clipboard.png`
 Requests that the macOS host import the current clipboard image to a shared file. Clipboard imports require confirmation on the host.
 
+`/yolobox/scripts/yolobox-open-url http://instance.local:3000`
+Requests that the macOS host open an mDNS-only guest service URL.
+
+`/yolobox/scripts/code [path]`
+Requests that the macOS host open a shared directory in VS Code. With no path, it uses the current guest working directory.
+
+`/yolobox/scripts/finder [path]`
+Requests that the macOS host open a shared directory in Finder. With no path, it uses the current guest working directory.
+
 These helpers do not expose arbitrary host command execution. They communicate with a host-side listener through the shared `/yolobox` runtime mount.
+
+To interact with these skills you can use prompts like:
+
+```Please open the generated index.html on my mac```
+
+```Start the dev server and open it in my browser```
+
+```Take a look at the screenshot in my clipboard```
 
 ### Init Scripts
 
@@ -241,7 +257,7 @@ yolobox base capture --name ubuntu-dev --repo git@github.com:org/repo.git --bran
 yolobox base capture --name ubuntu-dev --instance tools-box
 ```
 
-`base capture` snapshots a running instance's root disk as a new immutable base. Base names can't be overwritten in place -- remove the old one first if you need to reuse the name.
+`base capture` snapshots a running instance's root disk as a new immutable base. Base names can't be overwritten in place. Remove the old one first if you need to reuse the name.
 
 ## Accessing Guest Services
 

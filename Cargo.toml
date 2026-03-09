@@ -1,6 +1,6 @@
 [package]
 name = "yolobox"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "Branch-scoped Linux VMs for local development on macOS"
 license = "MIT"
