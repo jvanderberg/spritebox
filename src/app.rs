@@ -134,6 +134,9 @@ struct LaunchOptions {
     /// Prepare the instance and exit before launching or attaching to it.
     #[arg(long = "no-enter")]
     no_enter: bool,
+    /// Start the interactive guest shell directly instead of entering tmux.
+    #[arg(long = "no-tmux")]
+    no_tmux: bool,
     /// Number of virtual CPUs to allocate to the VM.
     #[arg(long, default_value_t = runtime::default_cpus())]
     cpus: u8,
@@ -478,6 +481,7 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
 
     let launch_config = LaunchConfig {
         require_vm: !options.shell_only,
+        use_tmux: !options.no_tmux,
         cpus: options.cpus,
         memory_mib: options.memory_mib,
         cloud_init_image: prepared_cloud_init
@@ -544,6 +548,7 @@ fn exec(options: ExecOptions) -> Result<(), String> {
     let host_bridge_mounts = host_bridge::managed_mounts(&instance, None)?;
     let launch_config = LaunchConfig {
         require_vm: true,
+        use_tmux: false,
         cpus: runtime::default_cpus(),
         memory_mib: runtime::default_memory_mib(),
         cloud_init_image: None,
@@ -1305,7 +1310,17 @@ mod tests {
         assert!(help.contains("--no-claude"));
         assert!(help.contains("--no-gh"));
         assert!(help.contains("--no-enter"));
+        assert!(help.contains("--no-tmux"));
         assert!(help.contains("Prepare the instance and exit before launching or attaching to it"));
+    }
+
+    #[test]
+    fn launch_parses_no_tmux_flag() {
+        let cli = Cli::parse(vec!["--no-tmux".to_string()]).expect("parse should succeed");
+        match cli.command {
+            Command::Launch(options) => assert!(options.no_tmux),
+            _ => panic!("expected launch command"),
+        }
     }
 
     #[test]

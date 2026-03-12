@@ -464,18 +464,49 @@ fn render_nofile_limits(user: &str) -> String {
 }
 
 fn render_ai_shell_defaults() -> String {
-    r#"claude() {
+    r#"_yolobox_restore_title() {
+  if [ -n "${YOLOBOX_INSTANCE_TITLE:-}" ]; then
+    printf '\033]0;%s\007' "$YOLOBOX_INSTANCE_TITLE"
+  fi
+}
+
+claude() {
   command claude --dangerously-skip-permissions "$@"
+  local status=$?
+  _yolobox_restore_title
+  return "$status"
 }
 
 codex() {
   command codex --dangerously-bypass-approvals-and-sandbox "$@"
+  local status=$?
+  _yolobox_restore_title
+  return "$status"
 }
 
 case ":${PATH:-}:" in
   *:/yolobox/scripts:*) ;;
   *) export PATH="/yolobox/scripts:${PATH:-}" ;;
 esac
+
+if [ -n "${ZSH_VERSION:-}" ]; then
+  autoload -Uz add-zsh-hook >/dev/null 2>&1 || true
+  if command -v add-zsh-hook >/dev/null 2>&1; then
+    add-zsh-hook precmd _yolobox_restore_title 2>/dev/null || true
+  fi
+elif [ -n "${BASH_VERSION:-}" ]; then
+  case ";${PROMPT_COMMAND:-};" in
+    *";_yolobox_restore_title;"*) ;;
+    *)
+      if [ -n "${PROMPT_COMMAND:-}" ]; then
+        PROMPT_COMMAND="_yolobox_restore_title; ${PROMPT_COMMAND}"
+      else
+        PROMPT_COMMAND="_yolobox_restore_title"
+      fi
+      export PROMPT_COMMAND
+      ;;
+  esac
+fi
 "#
     .to_string()
 }
@@ -576,6 +607,10 @@ mod tests {
         assert!(rendered.contains("* soft nofile 65536"));
         assert!(rendered.contains("command claude --dangerously-skip-permissions"));
         assert!(rendered.contains("command codex --dangerously-bypass-approvals-and-sandbox"));
+        assert!(rendered.contains("_yolobox_restore_title()"));
+        assert!(rendered.contains("printf '\\033]0;%s\\007' \"$YOLOBOX_INSTANCE_TITLE\""));
+        assert!(rendered.contains("add-zsh-hook precmd _yolobox_restore_title"));
+        assert!(rendered.contains("PROMPT_COMMAND=\"_yolobox_restore_title"));
         assert!(rendered.contains("export PATH=\"/yolobox/scripts:${PATH:-}\""));
         assert!(rendered.contains("workspace, /workspace, virtiofs"));
         assert!(rendered.contains("yolobox-requests, \"/yolobox/requests\", virtiofs"));
@@ -614,6 +649,7 @@ mod tests {
         assert!(rendered.contains("mkdir -p /home/vibe && chown vibe:vibe /home/vibe"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
+        assert!(rendered.contains("_yolobox_restore_title()"));
         assert!(rendered.contains("export PATH=\"/yolobox/scripts:${PATH:-}\""));
         assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
     }

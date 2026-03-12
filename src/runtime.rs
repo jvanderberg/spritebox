@@ -15,7 +15,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -48,6 +48,7 @@ pub struct RuntimePlan {
 
 pub struct LaunchConfig {
     pub require_vm: bool,
+    pub use_tmux: bool,
     pub cpus: u8,
     pub memory_mib: u32,
     pub cloud_init_image: Option<PathBuf>,
@@ -333,6 +334,7 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         &config.shares,
         &config.guest_env,
         config.verbose,
+        config.use_tmux,
     )
 }
 
@@ -616,20 +618,30 @@ fn connect_ssh(
     shares: &[ShareMount],
     guest_env: &[GuestEnvVar],
     verbose: bool,
+    use_tmux: bool,
 ) -> Result<i32, String> {
-    let interactive = io::stdin().is_terminal();
+    let interactive = true;
     let _bridge = host_bridge::start(instance)?;
+    let guest_command = guest_shell_command(
+        &instance.id,
+        shares,
+        guest_env,
+        verbose,
+        interactive,
+        use_tmux,
+    );
+    let _ = fs::write(
+        instance.instance_dir.join("runtime").join("launch-debug.txt"),
+        format!(
+            "interactive={interactive}\nuse_tmux={use_tmux}\ntmux_in_payload={}\ncommand={guest_command}\n",
+            guest_command.contains("tmux new-session")
+        ),
+    );
     let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, true);
     command
-        .arg(if interactive { "-tt" } else { "-T" })
+        .arg("-tt")
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
-        .arg(guest_shell_command(
-            &instance.id,
-            shares,
-            guest_env,
-            verbose,
-            interactive,
-        ));
+        .arg(guest_command);
 
     let status = command.status().map_err(|err| err.to_string())?;
     Ok(status.code().unwrap_or_default())
@@ -713,10 +725,17 @@ fn guest_shell_command(
     guest_env: &[GuestEnvVar],
     verbose: bool,
     interactive: bool,
+    use_tmux: bool,
 ) -> String {
+    let shell_exec = if interactive && use_tmux {
+        " if command -v tmux >/dev/null 2>&1; then session_name=\"${YOLOBOX_INSTANCE_TITLE:-yolobox}\"; if ! tmux has-session -t \"$session_name\" 2>/dev/null; then tmux new-session -d -s \"$session_name\" -n \"$session_name\" >/dev/null 2>&1; fi; tmux set-option -t \"$session_name\" mouse on >/dev/null 2>&1; exec tmux attach-session -t \"$session_name\"; else exec /bin/bash -l; fi;"
+    } else {
+        " exec /bin/bash -l;"
+    };
     let body = format!(
-        "{} exec /bin/bash -l",
-        guest_bootstrap_body(instance_id, shares, guest_env, verbose, interactive)
+        "{}{}",
+        guest_bootstrap_body(instance_id, shares, guest_env, verbose, interactive),
+        shell_exec
     );
 
     format!("bash -lc {}", shell_quote(&body))
@@ -789,7 +808,10 @@ fn guest_bootstrap_body(
         " case \":${PATH:-}:\" in *:/yolobox/scripts:*) ;; *) export PATH=\"/yolobox/scripts:${PATH:-}\" ;; esac;";
     let bridge_command_shims = " sudo mkdir -p /usr/local/bin; for tool in yolobox-open yolobox-open-url yolobox-paste-image code finder; do bridge_tool=\"/yolobox/scripts/$tool\"; shim_path=\"/usr/local/bin/$tool\"; if [ -x \"$bridge_tool\" ]; then if [ -L \"$shim_path\" ] || [ ! -e \"$shim_path\" ]; then sudo ln -sfn \"$bridge_tool\" \"$shim_path\"; fi; fi; done;";
     let title_setup = if interactive {
-        format!(" printf '\\033]0;%s\\007' {};", shell_quote(instance_id))
+        format!(
+            " export YOLOBOX_INSTANCE_TITLE={title}; printf '\\033]0;%s\\007' \"$YOLOBOX_INSTANCE_TITLE\";",
+            title = shell_quote(instance_id)
+        )
     } else {
         String::new()
     };
@@ -1316,6 +1338,7 @@ mod tests {
             }],
             true,
             true,
+            true,
         );
         assert!(command.contains("cloud-init status --wait"));
         assert!(command.contains("waiting for cloud-init/bootstrap"));
@@ -1332,6 +1355,14 @@ mod tests {
         assert!(command.contains("yolobox-responses"));
         assert!(command.contains("/yolobox/responses"));
         assert!(command.contains("export PATH=\"/yolobox/scripts:${PATH:-}\""));
+        assert!(command.contains("export YOLOBOX_INSTANCE_TITLE="));
+        assert!(command.contains("markless-main"));
+        assert!(command.contains("\\033]0;"));
+        assert!(command.contains("command -v tmux"));
+        assert!(command.contains("tmux has-session -t"));
+        assert!(command.contains("tmux new-session -d -s \"$session_name\" -n \"$session_name\""));
+        assert!(command.contains("tmux set-option -t \"$session_name\" mouse on"));
+        assert!(command.contains("tmux attach-session -t \"$session_name\""));
         assert!(command.contains(&format!("mount -t virtiofs {}", share_tag(0))));
         assert!(command.contains("/mnt/share"));
         assert!(command.contains("export ANTHROPIC_API_KEY="));
@@ -1342,7 +1373,7 @@ mod tests {
 
     #[test]
     fn quiet_guest_shell_suppresses_bootstrap_chatter() {
-        let command = guest_shell_command("markless-main", &[], &[], false, true);
+        let command = guest_shell_command("markless-main", &[], &[], false, true, true);
         assert!(command.contains("cloud-init status --wait >/dev/null 2>&1"));
         assert!(!command.contains("waiting for cloud-init/bootstrap"));
         assert!(!command.contains("bootstrap log:"));
@@ -1351,9 +1382,17 @@ mod tests {
 
     #[test]
     fn noninteractive_guest_shell_keeps_login_shell_and_skips_title_escape() {
-        let command = guest_shell_command("markless-main", &[], &[], false, false);
+        let command = guest_shell_command("markless-main", &[], &[], false, false, false);
         assert!(command.contains("exec /bin/bash -l"));
         assert!(!command.contains("\\033]0;"));
+        assert!(!command.contains("tmux new-session"));
+    }
+
+    #[test]
+    fn interactive_guest_shell_can_skip_tmux() {
+        let command = guest_shell_command("markless-main", &[], &[], false, true, false);
+        assert!(command.contains("exec /bin/bash -l"));
+        assert!(!command.contains("tmux set-option -t"));
     }
 
     #[test]
