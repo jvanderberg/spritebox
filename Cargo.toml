@@ -1,6 +1,6 @@
 [package]
 name = "yolobox"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 description = "Branch-scoped Linux VMs for local development on macOS"
 license = "MIT"
@@ -10,5 +10,6 @@ repository = "https://github.com/jvanderberg/yolobox"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 libc = "0.2"
+nix = { version = "0.29", features = ["fs", "process", "signal", "term", "ioctl"] }
 petname = "2"
 ratatui = "0.29"

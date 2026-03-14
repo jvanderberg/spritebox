@@ -6,16 +6,22 @@ use crate::state::{GuestEnvVar, Instance, ShareMount};
 use crossterm::cursor::{Hide, MoveTo, Show, position};
 use crossterm::execute;
 use crossterm::terminal::{Clear as TermClear, ClearType};
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::termios::{self, SetArg, Termios};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
+use std::ffi::{CString, OsStr};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -35,6 +41,9 @@ const SSH_PROBE_INTERVAL_MILLIS: u64 = 1000;
 const GUEST_WORKSPACE_PATH: &str = "/workspace";
 const GUEST_NOFILE_LIMIT: u64 = 65_536;
 const HOST_NOFILE_LIMIT: u64 = 65_536;
+const PTY_BUFFER_SIZE: usize = 8192;
+
+static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub enum LaunchMode {
     External(PathBuf),
@@ -48,7 +57,6 @@ pub struct RuntimePlan {
 
 pub struct LaunchConfig {
     pub require_vm: bool,
-    pub use_tmux: bool,
     pub cpus: u8,
     pub memory_mib: u32,
     pub cloud_init_image: Option<PathBuf>,
@@ -71,12 +79,183 @@ pub struct GuestExecCommand {
     pub args: Vec<String>,
 }
 
+enum OscFilterState {
+    Normal,
+    Esc,
+    OscStart,
+    TitleSeq,
+    TitleSeqEsc,
+}
+
+struct OscTitleFilter {
+    state: OscFilterState,
+    pending: Vec<u8>,
+}
+
+struct RawTerminalGuard {
+    original: Termios,
+}
+
+struct SigwinchGuard {
+    previous: SigAction,
+}
+
+struct ExecSpec {
+    program: CString,
+    args: Vec<CString>,
+}
+
 pub fn default_cpus() -> u8 {
     DEFAULT_CPUS
 }
 
 pub fn default_memory_mib() -> u32 {
     DEFAULT_MEMORY_MIB
+}
+
+impl OscTitleFilter {
+    fn new() -> Self {
+        Self {
+            state: OscFilterState::Normal,
+            pending: Vec::with_capacity(4),
+        }
+    }
+
+    fn feed(&mut self, input: &[u8], output: &mut Vec<u8>) -> bool {
+        output.clear();
+        let mut stripped_title = false;
+        for &byte in input {
+            match self.state {
+                OscFilterState::Normal => {
+                    if byte == 0x1b {
+                        self.state = OscFilterState::Esc;
+                    } else {
+                        output.push(byte);
+                    }
+                }
+                OscFilterState::Esc => {
+                    if byte == b']' {
+                        self.pending.clear();
+                        self.pending.push(0x1b);
+                        self.pending.push(byte);
+                        self.state = OscFilterState::OscStart;
+                    } else {
+                        output.push(0x1b);
+                        output.push(byte);
+                        self.state = OscFilterState::Normal;
+                    }
+                }
+                OscFilterState::OscStart => {
+                    self.pending.push(byte);
+                    match self.pending.len() {
+                        3 if matches!(byte, b'0' | b'1' | b'2') => {}
+                        4 if byte == b';' => {
+                            self.pending.clear();
+                            self.state = OscFilterState::TitleSeq;
+                        }
+                        _ => {
+                            output.extend_from_slice(&self.pending);
+                            self.pending.clear();
+                            self.state = OscFilterState::Normal;
+                        }
+                    }
+                }
+                OscFilterState::TitleSeq => {
+                    if byte == 0x07 {
+                        stripped_title = true;
+                        self.state = OscFilterState::Normal;
+                    } else if byte == 0x1b {
+                        self.state = OscFilterState::TitleSeqEsc;
+                    }
+                }
+                OscFilterState::TitleSeqEsc => {
+                    self.state = if byte == b'\\' {
+                        stripped_title = true;
+                        OscFilterState::Normal
+                    } else {
+                        OscFilterState::TitleSeq
+                    };
+                }
+            }
+        }
+        stripped_title
+    }
+
+    fn finish(&mut self, output: &mut Vec<u8>) {
+        output.clear();
+        match self.state {
+            OscFilterState::Esc => output.push(0x1b),
+            OscFilterState::OscStart => {
+                output.extend_from_slice(&self.pending);
+                self.pending.clear();
+            }
+            OscFilterState::Normal | OscFilterState::TitleSeq | OscFilterState::TitleSeqEsc => {}
+        }
+        self.state = OscFilterState::Normal;
+    }
+}
+
+impl RawTerminalGuard {
+    fn new(fd: RawFd) -> Result<Self, String> {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let original = termios::tcgetattr(borrowed).map_err(|err| err.to_string())?;
+        let mut raw = original.clone();
+        termios::cfmakeraw(&mut raw);
+        termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw).map_err(|err| err.to_string())?;
+        Ok(Self { original })
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        let _ = termios::tcsetattr(
+            unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) },
+            SetArg::TCSANOW,
+            &self.original,
+        );
+    }
+}
+
+impl SigwinchGuard {
+    fn install() -> Result<Self, String> {
+        let action = SigAction::new(
+            SigHandler::Handler(handle_sigwinch),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        let previous =
+            unsafe { signal::sigaction(Signal::SIGWINCH, &action) }.map_err(|err| err.to_string())?;
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for SigwinchGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { signal::sigaction(Signal::SIGWINCH, &self.previous) };
+    }
+}
+
+impl ExecSpec {
+    fn from_command(command: &Command) -> Result<Self, String> {
+        let program = os_str_to_cstring(command.get_program())?;
+        let mut args = Vec::new();
+        args.push(program.clone());
+        args.extend(
+            command
+                .get_args()
+                .map(|arg| os_str_to_cstring(arg))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(Self { program, args })
+    }
+}
+
+extern "C" fn handle_sigwinch(_: i32) {
+    SIGWINCH_PENDING.store(true, Ordering::Relaxed);
+}
+
+fn os_str_to_cstring(value: &OsStr) -> Result<CString, String> {
+    CString::new(value.as_bytes()).map_err(|_| format!("command contains NUL byte: {value:?}"))
 }
 
 pub fn command_exists(name: &str) -> bool {
@@ -334,7 +513,6 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         &config.shares,
         &config.guest_env,
         config.verbose,
-        config.use_tmux,
     )
 }
 
@@ -618,23 +796,15 @@ fn connect_ssh(
     shares: &[ShareMount],
     guest_env: &[GuestEnvVar],
     verbose: bool,
-    use_tmux: bool,
 ) -> Result<i32, String> {
     let interactive = true;
     let _bridge = host_bridge::start(instance)?;
-    let guest_command = guest_shell_command(
-        &instance.id,
-        shares,
-        guest_env,
-        verbose,
-        interactive,
-        use_tmux,
-    );
+    let guest_command = guest_shell_command(&instance.id, shares, guest_env, verbose, interactive);
     let _ = fs::write(
         instance.instance_dir.join("runtime").join("launch-debug.txt"),
         format!(
-            "interactive={interactive}\nuse_tmux={use_tmux}\ntmux_in_payload={}\ncommand={guest_command}\n",
-            guest_command.contains("tmux new-session")
+            "interactive={interactive}\nosc_title_filter=true\ntitle={}\ncommand={guest_command}\n",
+            instance.id,
         ),
     );
     let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, true);
@@ -643,8 +813,7 @@ fn connect_ssh(
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
         .arg(guest_command);
 
-    let status = command.status().map_err(|err| err.to_string())?;
-    Ok(status.code().unwrap_or_default())
+    run_intercepted_command(&command, &instance.id)
 }
 
 fn exec_ssh(
@@ -719,23 +888,289 @@ fn set_current_process_nofile_limit(limit: libc::rlim_t) -> Result<(), IoError> 
     Ok(())
 }
 
+fn run_intercepted_command(command: &Command, title: &str) -> Result<i32, String> {
+    let exec = ExecSpec::from_command(command)?;
+    let (master, slave) = open_proxy_pty()?;
+
+    let child_pid = spawn_pty_child(&exec, &master, &slave)?;
+    drop(slave);
+
+    let _raw = RawTerminalGuard::new(libc::STDIN_FILENO)?;
+    let _sigwinch = SigwinchGuard::install()?;
+    SIGWINCH_PENDING.store(true, Ordering::Relaxed);
+
+    proxy_pty(master, child_pid, title)
+}
+
+fn open_proxy_pty() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut winsize = current_winsize(libc::STDIN_FILENO);
+    let winsize_ptr = winsize
+        .as_mut()
+        .map_or(std::ptr::null_mut(), |value| value as *mut libc::winsize);
+    let status = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            winsize_ptr,
+        )
+    };
+    if status != 0 {
+        return Err(IoError::last_os_error().to_string());
+    }
+
+    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    Ok((master, slave))
+}
+
+fn spawn_pty_child(exec: &ExecSpec, master: &OwnedFd, slave: &OwnedFd) -> Result<libc::pid_t, String> {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(IoError::last_os_error().to_string());
+    }
+
+    if pid == 0 {
+        unsafe {
+            libc::close(master.as_raw_fd());
+            if libc::setsid() < 0 {
+                libc::_exit(1);
+            }
+            if libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                libc::_exit(1);
+            }
+            if libc::dup2(slave.as_raw_fd(), libc::STDIN_FILENO) < 0
+                || libc::dup2(slave.as_raw_fd(), libc::STDOUT_FILENO) < 0
+                || libc::dup2(slave.as_raw_fd(), libc::STDERR_FILENO) < 0
+            {
+                libc::_exit(1);
+            }
+            if slave.as_raw_fd() > libc::STDERR_FILENO {
+                libc::close(slave.as_raw_fd());
+            }
+
+            let mut argv = exec
+                .args
+                .iter()
+                .map(|arg| arg.as_ptr())
+                .collect::<Vec<_>>();
+            argv.push(std::ptr::null());
+            libc::execvp(exec.program.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+
+    Ok(pid)
+}
+
+fn proxy_pty(master: OwnedFd, child_pid: libc::pid_t, title: &str) -> Result<i32, String> {
+    let master_fd = master.as_raw_fd();
+    let mut stdin_open = true;
+    let mut child_status = None;
+    let mut input = [0u8; PTY_BUFFER_SIZE];
+    let mut output = [0u8; PTY_BUFFER_SIZE];
+    let mut filter = OscTitleFilter::new();
+    let mut filtered = Vec::with_capacity(PTY_BUFFER_SIZE);
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    let title_sequence = terminal_title_sequence(title);
+
+    if !title_sequence.is_empty() {
+        stdout
+            .write_all(&title_sequence)
+            .and_then(|_| stdout.flush())
+            .map_err(|err| err.to_string())?;
+    }
+
+    loop {
+        sync_proxy_winsize(master_fd);
+        if child_status.is_none() {
+            child_status = try_wait_pid(child_pid)?;
+        }
+
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: if stdin_open { libc::STDIN_FILENO } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: master_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let timeout = if child_status.is_some() { 100 } else { -1 };
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, timeout) };
+        if poll_result < 0 {
+            let error = IoError::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.to_string());
+        }
+
+        if stdin_open && (poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP)) != 0 {
+            match read_fd(libc::STDIN_FILENO, &mut input)? {
+                0 => stdin_open = false,
+                count => write_all_fd(master_fd, &input[..count])?,
+            }
+        }
+
+        if (poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+            match read_master(master_fd, &mut output)? {
+                Some(0) | None => break,
+                Some(count) => {
+                    let stripped_title = filter.feed(&output[..count], &mut filtered);
+                    if stripped_title && !title_sequence.is_empty() {
+                        stdout
+                            .write_all(&title_sequence)
+                            .and_then(|_| stdout.flush())
+                            .map_err(|err| err.to_string())?;
+                    }
+                    if !filtered.is_empty() {
+                        stdout
+                            .write_all(&filtered)
+                            .and_then(|_| stdout.flush())
+                            .map_err(|err| err.to_string())?;
+                    }
+                }
+            }
+        } else if child_status.is_some() && poll_result == 0 {
+            break;
+        }
+    }
+
+    filter.finish(&mut filtered);
+    if !filtered.is_empty() {
+        stdout
+            .write_all(&filtered)
+            .and_then(|_| stdout.flush())
+            .map_err(|err| err.to_string())?;
+    }
+
+    wait_for_pid(child_pid, child_status)
+}
+
+fn sync_proxy_winsize(master_fd: RawFd) {
+    if !SIGWINCH_PENDING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+
+    if let Some(winsize) = current_winsize(libc::STDIN_FILENO) {
+        let _ = unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize) };
+    }
+}
+
+fn current_winsize(fd: RawFd) -> Option<libc::winsize> {
+    let mut winsize = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut winsize) };
+    if result == 0 { Some(winsize) } else { None }
+}
+
+fn read_fd(fd: RawFd, buffer: &mut [u8]) -> Result<usize, String> {
+    loop {
+        let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count >= 0 {
+            return Ok(count as usize);
+        }
+
+        let error = IoError::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error.to_string());
+    }
+}
+
+fn read_master(fd: RawFd, buffer: &mut [u8]) -> Result<Option<usize>, String> {
+    loop {
+        let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count >= 0 {
+            return Ok(Some(count as usize));
+        }
+
+        let error = IoError::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if matches!(error.raw_os_error(), Some(libc::EIO)) {
+            return Ok(None);
+        }
+        return Err(error.to_string());
+    }
+}
+
+fn write_all_fd(fd: RawFd, mut buffer: &[u8]) -> Result<(), String> {
+    while !buffer.is_empty() {
+        let count = unsafe { libc::write(fd, buffer.as_ptr().cast(), buffer.len()) };
+        if count >= 0 {
+            buffer = &buffer[count as usize..];
+            continue;
+        }
+
+        let error = IoError::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn try_wait_pid(pid: libc::pid_t) -> Result<Option<WaitStatus>, String> {
+    match waitpid(Some(nix::unistd::Pid::from_raw(pid)), Some(WaitPidFlag::WNOHANG))
+        .map_err(|err| err.to_string())?
+    {
+        WaitStatus::StillAlive => Ok(None),
+        status => Ok(Some(status)),
+    }
+}
+
+fn wait_for_pid(pid: libc::pid_t, status: Option<WaitStatus>) -> Result<i32, String> {
+    let status = match status {
+        Some(status) => status,
+        None => waitpid(Some(nix::unistd::Pid::from_raw(pid)), None).map_err(|err| err.to_string())?,
+    };
+
+    Ok(match status {
+        WaitStatus::Exited(_, code) => code,
+        WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
+        _ => 1,
+    })
+}
+
+fn terminal_title_sequence(title: &str) -> Vec<u8> {
+    if title.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sequence = Vec::with_capacity(title.len() + 5);
+    sequence.extend_from_slice(b"\x1b]0;");
+    sequence.extend_from_slice(title.as_bytes());
+    sequence.push(0x07);
+    sequence
+}
+
 fn guest_shell_command(
     instance_id: &str,
     shares: &[ShareMount],
     guest_env: &[GuestEnvVar],
     verbose: bool,
     interactive: bool,
-    use_tmux: bool,
 ) -> String {
-    let shell_exec = if interactive && use_tmux {
-        " if command -v tmux >/dev/null 2>&1; then session_name=\"${YOLOBOX_INSTANCE_TITLE:-yolobox}\"; if ! tmux has-session -t \"$session_name\" 2>/dev/null; then tmux new-session -d -s \"$session_name\" -n \"$session_name\" >/dev/null 2>&1; fi; tmux set-option -t \"$session_name\" mouse on >/dev/null 2>&1; exec tmux attach-session -t \"$session_name\"; else exec /bin/bash -l; fi;"
-    } else {
-        " exec /bin/bash -l;"
-    };
     let body = format!(
-        "{}{}",
+        "{} exec /bin/bash -l",
         guest_bootstrap_body(instance_id, shares, guest_env, verbose, interactive),
-        shell_exec
     );
 
     format!("bash -lc {}", shell_quote(&body))
@@ -809,7 +1244,7 @@ fn guest_bootstrap_body(
     let bridge_command_shims = " sudo mkdir -p /usr/local/bin; for tool in yolobox-open yolobox-open-url yolobox-paste-image code finder; do bridge_tool=\"/yolobox/scripts/$tool\"; shim_path=\"/usr/local/bin/$tool\"; if [ -x \"$bridge_tool\" ]; then if [ -L \"$shim_path\" ] || [ ! -e \"$shim_path\" ]; then sudo ln -sfn \"$bridge_tool\" \"$shim_path\"; fi; fi; done;";
     let title_setup = if interactive {
         format!(
-            " export YOLOBOX_INSTANCE_TITLE={title}; printf '\\033]0;%s\\007' \"$YOLOBOX_INSTANCE_TITLE\";",
+            " export YOLOBOX_INSTANCE_TITLE={title};",
             title = shell_quote(instance_id)
         )
     } else {
@@ -1286,10 +1721,11 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_runtime_failure, encode_env_ports, guest_shell_command, krunkit_network_device,
-        loading_line, parse_instance_processes, parse_vmnet_helper_processes,
+        OscTitleFilter, detect_runtime_failure, encode_env_ports, guest_shell_command,
+        krunkit_network_device, loading_line, parse_instance_processes, parse_vmnet_helper_processes,
         running_vm_matches_shares, share_tag, should_probe_ssh, ssh_base_command,
         ssh_ready_timeout, stop_stale_vm, write_runtime_shares,
+        terminal_title_sequence,
     };
     use crate::host_bridge::ManagedMount;
     use crate::network::VmnetConfig;
@@ -1338,7 +1774,6 @@ mod tests {
             }],
             true,
             true,
-            true,
         );
         assert!(command.contains("cloud-init status --wait"));
         assert!(command.contains("waiting for cloud-init/bootstrap"));
@@ -1357,12 +1792,9 @@ mod tests {
         assert!(command.contains("export PATH=\"/yolobox/scripts:${PATH:-}\""));
         assert!(command.contains("export YOLOBOX_INSTANCE_TITLE="));
         assert!(command.contains("markless-main"));
-        assert!(command.contains("\\033]0;"));
-        assert!(command.contains("command -v tmux"));
-        assert!(command.contains("tmux has-session -t"));
-        assert!(command.contains("tmux new-session -d -s \"$session_name\" -n \"$session_name\""));
-        assert!(command.contains("tmux set-option -t \"$session_name\" mouse on"));
-        assert!(command.contains("tmux attach-session -t \"$session_name\""));
+        assert!(!command.contains("\\033]0;"));
+        assert!(command.contains("exec /bin/bash -l"));
+        assert!(!command.contains("tmux"));
         assert!(command.contains(&format!("mount -t virtiofs {}", share_tag(0))));
         assert!(command.contains("/mnt/share"));
         assert!(command.contains("export ANTHROPIC_API_KEY="));
@@ -1373,7 +1805,7 @@ mod tests {
 
     #[test]
     fn quiet_guest_shell_suppresses_bootstrap_chatter() {
-        let command = guest_shell_command("markless-main", &[], &[], false, true, true);
+        let command = guest_shell_command("markless-main", &[], &[], false, true);
         assert!(command.contains("cloud-init status --wait >/dev/null 2>&1"));
         assert!(!command.contains("waiting for cloud-init/bootstrap"));
         assert!(!command.contains("bootstrap log:"));
@@ -1382,17 +1814,60 @@ mod tests {
 
     #[test]
     fn noninteractive_guest_shell_keeps_login_shell_and_skips_title_escape() {
-        let command = guest_shell_command("markless-main", &[], &[], false, false, false);
+        let command = guest_shell_command("markless-main", &[], &[], false, false);
         assert!(command.contains("exec /bin/bash -l"));
         assert!(!command.contains("\\033]0;"));
-        assert!(!command.contains("tmux new-session"));
+        assert!(!command.contains("tmux"));
     }
 
     #[test]
-    fn interactive_guest_shell_can_skip_tmux() {
-        let command = guest_shell_command("markless-main", &[], &[], false, true, false);
+    fn interactive_guest_shell_uses_plain_login_shell() {
+        let command = guest_shell_command("markless-main", &[], &[], false, true);
         assert!(command.contains("exec /bin/bash -l"));
-        assert!(!command.contains("tmux set-option -t"));
+        assert!(!command.contains("tmux"));
+    }
+
+    #[test]
+    fn osc_title_filter_strips_bel_terminated_titles() {
+        let mut filter = OscTitleFilter::new();
+        let mut output = Vec::new();
+        assert!(filter.feed(b"hello\x1b]0;title\x07world", &mut output));
+        assert_eq!(output, b"helloworld");
+    }
+
+    #[test]
+    fn osc_title_filter_strips_st_terminated_titles_across_reads() {
+        let mut filter = OscTitleFilter::new();
+        let mut output = Vec::new();
+        assert!(!filter.feed(b"left\x1b]2;title", &mut output));
+        assert_eq!(output, b"left");
+        assert!(filter.feed(b"\x1b\\right", &mut output));
+        assert_eq!(output, b"right");
+    }
+
+    #[test]
+    fn osc_title_filter_preserves_non_title_osc_sequences() {
+        let mut filter = OscTitleFilter::new();
+        let mut output = Vec::new();
+        let input = b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+        assert!(!filter.feed(input, &mut output));
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn osc_title_filter_flushes_incomplete_non_title_prefix() {
+        let mut filter = OscTitleFilter::new();
+        let mut output = Vec::new();
+        assert!(!filter.feed(b"abc\x1b]0", &mut output));
+        assert_eq!(output, b"abc");
+        filter.finish(&mut output);
+        assert_eq!(output, b"\x1b]0");
+    }
+
+    #[test]
+    fn terminal_title_sequence_uses_instance_name() {
+        assert_eq!(terminal_title_sequence("pico-gamer-main"), b"\x1b]0;pico-gamer-main\x07");
+        assert!(terminal_title_sequence("").is_empty());
     }
 
     #[test]
