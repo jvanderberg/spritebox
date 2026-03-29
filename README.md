@@ -38,10 +38,6 @@ spritebox handles:
 
 Interactive sessions use WebSocket connections to the Sprites API — no SSH needed.
 
-## Yolo Mode
-
-Claude and Codex are pre-installed in the sprite. Just type `claude` or `codex`.
-
 ## Setup
 
 ### Prerequisites
