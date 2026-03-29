@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[allow(dead_code)]
 pub fn ensure_checkout(
     checkout_dir: &Path,
     repo: &str,
@@ -101,11 +102,11 @@ pub fn list_recent_remote_branches(repo: &str, limit: usize) -> Result<Vec<Strin
         branches.sort_by_key(|branch| branch == "HEAD");
         branches.dedup();
 
-        if let Ok(default_branch) = default_remote_branch(&temp_dir) {
-            if let Some(index) = branches.iter().position(|branch| branch == &default_branch) {
-                let branch = branches.remove(index);
-                branches.insert(0, branch);
-            }
+        if let Ok(default_branch) = default_remote_branch(&temp_dir)
+            && let Some(index) = branches.iter().position(|branch| branch == &default_branch)
+        {
+            let branch = branches.remove(index);
+            branches.insert(0, branch);
         }
 
         branches.truncate(limit);
@@ -174,7 +175,7 @@ fn create_temp_git_dir() -> Result<PathBuf, String> {
             .duration_since(UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_nanos();
-        let path = base.join(format!("yolobox-git-{pid}-{nanos}-{attempt}"));
+        let path = base.join(format!("spritebox-git-{pid}-{nanos}-{attempt}"));
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,

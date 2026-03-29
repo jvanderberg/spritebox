@@ -1,16 +1,14 @@
 mod app;
-mod cloud_init;
+mod auth;
 mod git;
-mod host_bridge;
-mod network;
-mod ports;
-mod runtime;
+mod sprites_api;
 mod state;
 
 use std::process;
 
-fn main() {
-    if let Err(err) = app::run() {
+#[tokio::main]
+async fn main() {
+    if let Err(err) = app::run().await {
         eprintln!("error: {err}");
         process::exit(1);
     }

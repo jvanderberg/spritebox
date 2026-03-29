@@ -1,16 +1,21 @@
 [package]
-name = "yolobox"
-version = "0.3.8"
+name = "spritebox"
+version = "0.1.0"
 edition = "2024"
-description = "Branch-scoped Linux VMs for local development on macOS"
+description = "Branch-scoped development environments powered by Fly.io Sprites"
 license = "MIT"
-repository = "https://github.com/jvanderberg/yolobox"
+repository = "https://github.com/jvanderberg/spritebox"
 
 [dependencies]
-base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.28"
-libc = "0.2"
-nix = { version = "0.29", features = ["fs", "process", "signal", "term", "ioctl"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+http = "1"
 petname = "2"
-ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+rpassword = "7.4.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+url = "2"
