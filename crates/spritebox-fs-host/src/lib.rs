@@ -18,9 +18,13 @@ use bytes::Bytes;
 use spritebox_fs_protocol::{FileAttr, FileKind};
 use std::path::{Path, PathBuf};
 
+pub mod dispatch;
+pub mod inode_table;
 pub mod mem;
 pub mod tokio_fs;
 
+pub use dispatch::Dispatcher;
+pub use inode_table::InodeTable;
 pub use mem::MemFs;
 pub use tokio_fs::TokioFs;
 
