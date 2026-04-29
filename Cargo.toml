@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/spritebox-fs-protocol",
     "crates/spritebox-fs-host",
+    "crates/spritebox-fs-transport",
 ]
 
 [workspace.dependencies]
