@@ -30,7 +30,9 @@ use spritebox_fs_transport::{FrameSink, FrameStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub mod cache;
+pub mod content_cache;
 pub use cache::{CacheConfig, CacheStats, CachedRemote};
+pub use content_cache::{ContentCache, ContentCacheConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {

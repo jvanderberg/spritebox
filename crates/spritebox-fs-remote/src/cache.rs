@@ -34,13 +34,17 @@ use spritebox_fs_transport::FrameSink;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
-use crate::{CmdClient, ClientError, ClientResult, DirPage, PassthroughRemote, RemoteFs};
+use crate::{
+    CmdClient, ClientError, ClientResult, DirPage, PassthroughRemote, RemoteFs,
+    content_cache::{ContentCache, ContentCacheConfig},
+};
 
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     pub attr_ttl: Duration,
     pub lookup_ttl: Duration,
     pub negative_ttl: Duration,
+    pub content: ContentCacheConfig,
 }
 
 impl Default for CacheConfig {
@@ -49,6 +53,7 @@ impl Default for CacheConfig {
             attr_ttl: Duration::from_secs(1),
             lookup_ttl: Duration::from_secs(1),
             negative_ttl: Duration::from_secs(1),
+            content: ContentCacheConfig::default(),
         }
     }
 }
@@ -71,10 +76,10 @@ enum LookupEntry {
     },
 }
 
-#[derive(Default)]
 struct CacheState {
     attrs: HashMap<Ino, AttrEntry>,
     lookups: HashMap<(Ino, String), LookupEntry>,
+    content: ContentCache,
     /// Stats for tests / diagnostics.
     hits_attr: u64,
     misses_attr: u64,
@@ -91,9 +96,19 @@ pub struct CachedRemote<S: FrameSink> {
 
 impl<S: FrameSink> CachedRemote<S> {
     pub fn new(client: Arc<CmdClient<S>>, config: CacheConfig) -> Arc<Self> {
+        let state = CacheState {
+            attrs: HashMap::new(),
+            lookups: HashMap::new(),
+            content: ContentCache::new(config.content),
+            hits_attr: 0,
+            misses_attr: 0,
+            hits_lookup: 0,
+            misses_lookup: 0,
+            hits_negative: 0,
+        };
         Arc::new(Self {
             inner: PassthroughRemote::new(client),
-            state: Arc::new(Mutex::new(CacheState::default())),
+            state: Arc::new(Mutex::new(state)),
             config,
         })
     }
@@ -120,11 +135,15 @@ impl<S: FrameSink> CachedRemote<S> {
         CacheStats {
             attr_entries: s.attrs.len(),
             lookup_entries: s.lookups.len(),
+            content_chunks: s.content.len(),
             hits_attr: s.hits_attr,
             misses_attr: s.misses_attr,
             hits_lookup: s.hits_lookup,
             misses_lookup: s.misses_lookup,
             hits_negative: s.hits_negative,
+            hits_content: s.content.hits,
+            misses_content: s.content.misses,
+            evictions_content: s.content.evictions,
         }
     }
 }
@@ -133,11 +152,15 @@ impl<S: FrameSink> CachedRemote<S> {
 pub struct CacheStats {
     pub attr_entries: usize,
     pub lookup_entries: usize,
+    pub content_chunks: usize,
     pub hits_attr: u64,
     pub misses_attr: u64,
     pub hits_lookup: u64,
     pub misses_lookup: u64,
     pub hits_negative: u64,
+    pub hits_content: u64,
+    pub misses_content: u64,
+    pub evictions_content: u64,
 }
 
 fn apply_push(s: &mut CacheState, push: Push) {
@@ -148,14 +171,16 @@ fn apply_push(s: &mut CacheState, push: Push) {
         Push::InvalidateEntry { parent, name, .. } => {
             s.lookups.remove(&(parent, name));
         }
-        Push::InvalidateData { ino, .. } => {
-            // No content cache yet — but invalidating attrs covers the
-            // size/mtime mismatch a content change implies.
+        Push::InvalidateData { ino, offset, len } => {
             s.attrs.remove(&ino);
+            s.content.invalidate_range(ino, offset, len);
         }
         Push::Resync { .. } => {
             s.attrs.clear();
             s.lookups.clear();
+            // Drop all content. ContentCache doesn't have a clear() — just
+            // re-init it.
+            s.content = ContentCache::new(s.content.config_snapshot());
         }
     }
 }
@@ -260,8 +285,58 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         offset: u64,
         size: u32,
     ) -> ClientResult<Bytes> {
-        // No content cache yet.
-        self.inner.read(ino, handle, offset, size).await
+        let chunk_size = self.config.content.chunk_size as u64;
+        if size as u64 > chunk_size * 4 || chunk_size == 0 {
+            // Don't cache pathologically large reads; pass through.
+            return self.inner.read(ino, handle, offset, size).await;
+        }
+
+        let mut out: Vec<u8> = Vec::with_capacity(size as usize);
+        let mut cur_offset = offset;
+        let mut remaining = size as u64;
+
+        while remaining > 0 {
+            let chunk_idx = cur_offset / chunk_size;
+            let off_in_chunk = (cur_offset - chunk_idx * chunk_size) as usize;
+
+            // Try cache first.
+            let chunk_bytes = {
+                let mut s = self.state.lock().await;
+                s.content.get(ino, chunk_idx)
+            };
+
+            let chunk_bytes = match chunk_bytes {
+                Some(b) => b,
+                None => {
+                    // Fetch the full chunk from the host.
+                    let fetch_offset = chunk_idx * chunk_size;
+                    let fetched = self
+                        .inner
+                        .read(ino, handle, fetch_offset, chunk_size as u32)
+                        .await?;
+                    {
+                        let mut s = self.state.lock().await;
+                        s.content.insert(ino, chunk_idx, fetched.clone());
+                    }
+                    fetched
+                }
+            };
+
+            if off_in_chunk >= chunk_bytes.len() {
+                // EOF inside this chunk.
+                break;
+            }
+            let take = (chunk_bytes.len() - off_in_chunk).min(remaining as usize);
+            out.extend_from_slice(&chunk_bytes[off_in_chunk..off_in_chunk + take]);
+            cur_offset += take as u64;
+            remaining -= take as u64;
+
+            if chunk_bytes.len() < chunk_size as usize {
+                // The chunk was short — that means we've hit EOF.
+                break;
+            }
+        }
+        Ok(Bytes::from(out))
     }
 
     async fn write(
@@ -271,11 +346,13 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         offset: u64,
         data: &[u8],
     ) -> ClientResult<u32> {
-        // Writes invalidate attr cache (size/mtime change).
+        // Writes invalidate attr cache (size/mtime change) and content
+        // cache for the affected range.
         let result = self.inner.write(ino, handle, offset, data).await;
         if result.is_ok() {
             let mut s = self.state.lock().await;
             s.attrs.remove(&ino);
+            s.content.invalidate_range(ino, offset, data.len() as u64);
         }
         result
     }
@@ -377,7 +454,9 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
     async fn truncate(&self, ino: Ino, size: u64) -> ClientResult<()> {
         let result = self.inner.truncate(ino, size).await;
         if result.is_ok() {
-            self.state.lock().await.attrs.remove(&ino);
+            let mut s = self.state.lock().await;
+            s.attrs.remove(&ino);
+            s.content.invalidate_ino(ino);
         }
         result
     }
@@ -572,6 +651,167 @@ mod tests {
         cached.write(attr.ino, fh, 0, b"hello").await.unwrap();
         let new_attr = cached.getattr(attr.ino).await.unwrap();
         assert_eq!(new_attr.size, 5);
+    }
+
+    #[tokio::test]
+    async fn content_cache_serves_repeat_reads_from_cache() {
+        let cfg = CacheConfig {
+            content: ContentCacheConfig {
+                chunk_size: 16,
+                max_chunks: 8,
+            },
+            ..Default::default()
+        };
+        let (cached, _fs, _) = rig(cfg).await;
+        let attr = cached
+            .create(ROOT_INO, "f", 0o644, rw_flags())
+            .await
+            .unwrap();
+        let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
+        cached.write(attr.ino, fh, 0, b"hello-world-xyz!").await.unwrap();
+
+        // First read populates the cache.
+        let r1 = cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        // Second and third reads hit the cache.
+        let r2 = cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        let r3 = cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        assert_eq!(&r1[..], b"hello-world-xyz!");
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+        let stats = cached.stats().await;
+        assert!(stats.hits_content >= 2);
+    }
+
+    #[tokio::test]
+    async fn content_cache_invalidated_by_write() {
+        let cfg = CacheConfig {
+            content: ContentCacheConfig {
+                chunk_size: 16,
+                max_chunks: 8,
+            },
+            ..Default::default()
+        };
+        let (cached, _fs, _) = rig(cfg).await;
+        let attr = cached
+            .create(ROOT_INO, "f", 0o644, rw_flags())
+            .await
+            .unwrap();
+        let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
+        cached.write(attr.ino, fh, 0, b"original").await.unwrap();
+
+        let r1 = cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        cached.write(attr.ino, fh, 0, b"replaced").await.unwrap();
+        let r2 = cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        assert!(r1.starts_with(b"original"));
+        assert!(r2.starts_with(b"replaced"));
+    }
+
+    #[tokio::test]
+    async fn content_cache_evicts_under_pressure() {
+        let cfg = CacheConfig {
+            content: ContentCacheConfig {
+                chunk_size: 16,
+                max_chunks: 2,
+            },
+            ..Default::default()
+        };
+        let (cached, _fs, _) = rig(cfg).await;
+        // Three files, three chunks → forces eviction.
+        for n in &["a", "b", "c"] {
+            let attr = cached
+                .create(ROOT_INO, n, 0o644, rw_flags())
+                .await
+                .unwrap();
+            let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
+            cached.write(attr.ino, fh, 0, b"data-data-data!").await.unwrap();
+            cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        }
+        let stats = cached.stats().await;
+        assert!(stats.evictions_content >= 1);
+        assert_eq!(stats.content_chunks, 2);
+    }
+
+    #[tokio::test]
+    async fn content_cache_invalidate_data_push_drops_chunks() {
+        let cfg = CacheConfig {
+            content: ContentCacheConfig {
+                chunk_size: 16,
+                max_chunks: 8,
+            },
+            ..Default::default()
+        };
+        let (cached, host_fs, push_tx) = rig(cfg).await;
+        let attr = cached
+            .create(ROOT_INO, "f", 0o644, rw_flags())
+            .await
+            .unwrap();
+        let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
+        cached.write(attr.ino, fh, 0, b"FROM-SPRITE!!!!!").await.unwrap();
+        cached.read(attr.ino, fh, 0, 16).await.unwrap();
+
+        // Host edits the file directly.
+        host_fs
+            .write(std::path::Path::new("f"), 0, b"FROM-HOST!!!!!!!")
+            .await
+            .unwrap();
+        push_tx
+            .send(Push::InvalidateData {
+                ino: attr.ino,
+                offset: 0,
+                len: 16,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let bytes = cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        assert_eq!(&bytes[..], b"FROM-HOST!!!!!!!");
+    }
+
+    /// Cache-transparency: identical sequence of reads against
+    /// PassthroughRemote and CachedRemote must produce identical bytes,
+    /// regardless of cache state.
+    #[tokio::test]
+    async fn cache_transparency_under_random_reads() {
+        let cfg = CacheConfig {
+            content: ContentCacheConfig {
+                chunk_size: 16,
+                max_chunks: 4,
+            },
+            ..Default::default()
+        };
+        let (cached, host_fs, _) = rig(cfg).await;
+
+        let attr = cached
+            .create(ROOT_INO, "f", 0o644, rw_flags())
+            .await
+            .unwrap();
+        let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
+        let payload: Vec<u8> = (0..200u8).collect();
+        cached.write(attr.ino, fh, 0, &payload).await.unwrap();
+
+        // 100 random reads across the file.
+        let pattern: Vec<(u64, u32)> = (0..100)
+            .map(|i| {
+                let off = (i * 37) % 200;
+                let size = ((i * 11) % 64).max(1) as u32;
+                (off as u64, size)
+            })
+            .collect();
+
+        for (off, size) in &pattern {
+            let from_cache = cached.read(attr.ino, fh, *off, *size).await.unwrap();
+            // Compute ground truth from the host (whose state is the source).
+            let truth = host_fs
+                .read(std::path::Path::new("f"), *off, *size)
+                .await
+                .unwrap();
+            assert_eq!(
+                from_cache, truth,
+                "divergence at offset {} size {}",
+                off, size
+            );
+        }
     }
 
     #[tokio::test]
