@@ -1,9 +1,16 @@
 [workspace]
-members = [".", "crates/spritebox-fs-protocol"]
+members = [
+    ".",
+    "crates/spritebox-fs-protocol",
+    "crates/spritebox-fs-host",
+]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 bytes = { version = "1", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+spritebox-fs-protocol = { path = "crates/spritebox-fs-protocol" }
 
 [package]
 name = "spritebox"
