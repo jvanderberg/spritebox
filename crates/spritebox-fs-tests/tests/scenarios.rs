@@ -440,6 +440,40 @@ async fn fault_dropped_response_does_not_hang_forever() {
     assert!(r.is_err(), "request returned despite all responses dropped");
 }
 
+// 13. Transit-byte corruption — must surface as EIO via hash-on-receive,
+//     never silently propagate corrupt bytes.
+#[tokio::test]
+async fn s13_transit_corruption_surfaces_eio() {
+    let h = Harness::new().await;
+    let attr = h
+        .remote
+        .create(ROOT_INO, "f", 0o644, rw_flags())
+        .await
+        .unwrap();
+    let fh = h.remote.open(attr.ino, rw_flags()).await.unwrap();
+    h.remote
+        .write(attr.ino, fh, 0, b"correct-bytes-here")
+        .await
+        .unwrap();
+
+    // Inject corruption on the next response (whichever ID it ends up being).
+    // Find that ID by introspecting CmdClient... we can't, so we corrupt a
+    // wide range of upcoming RequestIds. The harness's next_id is an
+    // AtomicU64 internal to CmdClient — easiest to just corrupt a few
+    // candidate IDs.
+    for candidate in 1..50 {
+        h.s2c_controls.set_corruption(candidate, 3).await;
+    }
+
+    // Read back; the bytes are corrupted in transit, the hash was computed
+    // over the original — so the receiver should reject with EIO.
+    let r = h.remote.read(attr.ino, fh, 0, 64).await;
+    assert!(
+        matches!(r, Err(ClientError::Errno(errno)) if errno == e::EIO),
+        "expected EIO on corrupted transit, got {r:?}"
+    );
+}
+
 // Latency pass-through: introduce 100ms latency in both directions and
 // assert a round-trip takes at least ~200ms.
 #[tokio::test]

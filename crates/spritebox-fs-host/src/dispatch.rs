@@ -223,7 +223,7 @@ impl<F: HostFs> Dispatcher<F> {
             Err(r) => return r,
         };
         match self.fs.read(&path, offset, size).await {
-            Ok(b) => Response::Bytes(b),
+            Ok(b) => Response::bytes(b),
             Err(err) => Response::Error { errno: err.errno() },
         }
     }
@@ -492,7 +492,7 @@ mod tests {
         };
         assert_eq!(bytes, 5);
 
-        let Response::Bytes(b) = handle(
+        let Response::Bytes { data, hash } = handle(
             &d,
             Request::Read {
                 ino,
@@ -505,7 +505,8 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(&b[..], b"hello");
+        assert_eq!(&data[..], b"hello");
+        assert!(hash.verify(&data));
 
         let r = handle(
             &d,

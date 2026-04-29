@@ -286,7 +286,12 @@ impl<S: FrameSink> RemoteFs for PassthroughRemote<S> {
             })
             .await?
         {
-            Response::Bytes(b) => Ok(b),
+            Response::Bytes { data, hash } => {
+                if !hash.verify(&data) {
+                    return Err(ClientError::Errno(e::EIO));
+                }
+                Ok(data)
+            }
             Response::Error { errno } => Err(ClientError::Errno(errno)),
             _ => Err(ClientError::Protocol),
         }

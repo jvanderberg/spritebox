@@ -155,6 +155,34 @@ pub struct StatFs {
     pub namelen: u32,
 }
 
+/// SHA-256 digest of a payload, used for hash-on-receive integrity checks.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sha256(pub [u8; 32]);
+
+impl std::fmt::Debug for Sha256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sha256:")?;
+        for b in &self.0[..4] {
+            write!(f, "{b:02x}")?;
+        }
+        write!(f, "…")
+    }
+}
+
+impl Sha256 {
+    pub fn of(bytes: &[u8]) -> Self {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        Sha256(out)
+    }
+
+    pub fn verify(&self, bytes: &[u8]) -> bool {
+        Sha256::of(bytes) == *self
+    }
+}
+
 /// Server → client response payload, paired with a request by `RequestId`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
@@ -169,7 +197,14 @@ pub enum Response {
     OpenOk {
         handle: u64,
     },
-    Bytes(Bytes),
+    /// File-content payload with a SHA-256 of the bytes for end-to-end
+    /// integrity checking. The receiver MUST verify before serving the
+    /// data to a caller; mismatches surface as `EIO` (the transport may
+    /// have corrupted the frame).
+    Bytes {
+        data: Bytes,
+        hash: Sha256,
+    },
     Written {
         bytes: u32,
     },
@@ -178,6 +213,14 @@ pub enum Response {
     Error {
         errno: Errno,
     },
+}
+
+impl Response {
+    /// Build a `Bytes` response and compute the hash from `data`.
+    pub fn bytes(data: Bytes) -> Self {
+        let hash = Sha256::of(&data);
+        Response::Bytes { data, hash }
+    }
 }
 
 /// Out-of-band server-initiated message. Used by the host watcher to keep
@@ -292,17 +335,29 @@ mod tests {
         let payload = Bytes::from_static(&[0u8, 1, 2, 3, 4, 0xff, 0xfe]);
         let frame = Frame::Response {
             id: 7,
-            body: Response::Bytes(payload.clone()),
+            body: Response::bytes(payload.clone()),
         };
         let json = serde_json::to_string(&frame).unwrap();
         let back: Frame = serde_json::from_str(&json).unwrap();
         match back {
             Frame::Response {
-                body: Response::Bytes(b),
+                body: Response::Bytes { data, hash },
                 ..
-            } => assert_eq!(b, payload),
+            } => {
+                assert_eq!(data, payload);
+                assert!(hash.verify(&data));
+            }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sha256_detects_corruption() {
+        let data = Bytes::from_static(b"hello world");
+        let hash = Sha256::of(&data);
+        assert!(hash.verify(&data));
+        let corrupted = Bytes::from_static(b"hello worle");
+        assert!(!hash.verify(&corrupted));
     }
 
     #[test]

@@ -336,7 +336,7 @@ fn approx_frame_size(frame: &Frame) -> u64 {
             _ => 64,
         },
         Frame::Response { body, .. } => match body {
-            Response::Bytes(b) => 32 + b.len() as u64,
+            Response::Bytes { data, .. } => 64 + data.len() as u64,
             Response::DirPage { entries, .. } => 32 + (entries.len() as u64 * 64),
             _ => 32,
         },
@@ -369,14 +369,19 @@ fn apply_corruption(policy: &mut Policy, frame: Frame) -> Frame {
         return frame;
     };
     let new_body = match body {
-        Response::Bytes(bytes) => {
-            let mut v = bytes.to_vec();
+        Response::Bytes { data, hash } => {
+            // Corrupt the *data* but leave the hash untouched. That's the
+            // point: hash-on-receive must catch transit corruption.
+            let mut v = data.to_vec();
             for c in &taken {
                 if c.byte_offset < v.len() {
                     v[c.byte_offset] ^= 0xFF;
                 }
             }
-            Response::Bytes(bytes::Bytes::from(v))
+            Response::Bytes {
+                data: bytes::Bytes::from(v),
+                hash,
+            }
         }
         other => other,
     };
@@ -411,7 +416,7 @@ mod tests {
     fn resp_bytes(id: RequestId, payload: &'static [u8]) -> Frame {
         Frame::Response {
             id,
-            body: Response::Bytes(bytes::Bytes::from_static(payload)),
+            body: Response::bytes(bytes::Bytes::from_static(payload)),
         }
     }
 
@@ -512,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corruption_flips_byte_in_matching_response() {
+    async fn corruption_flips_byte_in_matching_response_but_leaves_hash() {
         let (mut a, mut b, _ca, cb) = make();
         cb.set_corruption(7, 2).await;
         b.sink.send(resp_bytes(7, b"hello")).await.unwrap();
@@ -523,13 +528,17 @@ mod tests {
         match frame {
             Frame::Response {
                 id: 7,
-                body: Response::Bytes(b),
+                body: Response::Bytes { data, hash },
             } => {
-                assert_eq!(b[0], b'h');
-                assert_eq!(b[1], b'e');
-                assert_eq!(b[2], b'l' ^ 0xFF);
-                assert_eq!(b[3], b'l');
-                assert_eq!(b[4], b'o');
+                assert_eq!(data[0], b'h');
+                assert_eq!(data[1], b'e');
+                assert_eq!(data[2], b'l' ^ 0xFF);
+                assert_eq!(data[3], b'l');
+                assert_eq!(data[4], b'o');
+                // The hash was set for the original payload — so it must NOT
+                // verify against the corrupted data. That's how hash-on-receive
+                // catches transit corruption.
+                assert!(!hash.verify(&data));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -547,9 +556,10 @@ mod tests {
         match frame {
             Frame::Response {
                 id: 7,
-                body: Response::Bytes(b),
+                body: Response::Bytes { data, hash },
             } => {
-                assert_eq!(&b[..], b"hello");
+                assert_eq!(&data[..], b"hello");
+                assert!(hash.verify(&data));
             }
             other => panic!("unexpected: {other:?}"),
         }
