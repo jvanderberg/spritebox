@@ -29,6 +29,9 @@ use spritebox_fs_protocol::{
 use spritebox_fs_transport::{FrameSink, FrameStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+pub mod cache;
+pub use cache::{CacheConfig, CacheStats, CachedRemote};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
     /// The transport closed before a response arrived.
