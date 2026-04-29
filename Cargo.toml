@@ -43,3 +43,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 url = "2"
+spritebox-fs-protocol = { workspace = true }
+spritebox-fs-transport = { workspace = true }
+spritebox-fs-host = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

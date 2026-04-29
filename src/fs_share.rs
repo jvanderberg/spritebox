@@ -1,0 +1,291 @@
+//! `spritebox share` — host-side runner for the virtual filesystem.
+//!
+//! Runs a long-lived FS share between a local directory and a sprite's
+//! mount point. On invocation:
+//!
+//! 1. Ensure /dev/fuse is openable on the sprite (`chmod 666`).
+//! 2. Push the cross-compiled `spritebox-fsd` binary to the sprite.
+//! 3. mkdir the mount point.
+//! 4. Open an exec WebSocket running the daemon.
+//! 5. Wrap the WS as a `FrameSink`/`FrameStream` pair.
+//! 6. Run the host-side `Dispatcher` backed by a `TokioFs` rooted at the
+//!    local directory; serve `Frame::Request`s from the daemon.
+//! 7. Spawn a `notify` watcher on the local directory that pushes
+//!    `Push` frames back to the sprite as files change.
+//!
+//! The daemon binary must be pre-built for `x86_64-unknown-linux-gnu`
+//! (or whatever the sprite arch is). For local development build via:
+//!
+//! ```bash
+//! docker run --rm -v "$(pwd)":/work -w /work rust:1 \\
+//!     cargo build --release -p spritebox-fsd --target x86_64-unknown-linux-gnu
+//! ```
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use futures_util::StreamExt;
+use spritebox_fs_host::watcher::WatcherConfig;
+use spritebox_fs_host::{Dispatcher, TokioFs, watcher};
+use spritebox_fs_protocol::Frame;
+use spritebox_fs_transport::{FrameSink, FrameStream, WsFrameSink, WsFrameStream};
+use tokio::sync::{Mutex, mpsc};
+
+use crate::sprites_api::SpritesClient;
+
+#[derive(Debug, Clone)]
+pub struct ShareSpec {
+    pub local: PathBuf,
+    pub remote: String,
+}
+
+impl ShareSpec {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let (local_str, remote_str) = spec
+            .split_once(':')
+            .ok_or_else(|| "share must be LOCAL:REMOTE".to_string())?;
+        let local = PathBuf::from(local_str);
+        if !local.is_absolute() {
+            return Err(format!(
+                "local share path must be absolute: {local_str}"
+            ));
+        }
+        if !local.is_dir() {
+            return Err(format!(
+                "local share path is not a directory: {local_str}"
+            ));
+        }
+        if !remote_str.starts_with('/') {
+            return Err(format!(
+                "remote mount point must be absolute: {remote_str}"
+            ));
+        }
+        Ok(ShareSpec {
+            local,
+            remote: remote_str.to_string(),
+        })
+    }
+}
+
+/// Default search paths for a pre-built `spritebox-fsd` binary.
+fn locate_daemon_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(p) = explicit {
+        if !p.exists() {
+            return Err(format!(
+                "daemon binary not found at: {}",
+                p.display()
+            ));
+        }
+        return Ok(p.to_path_buf());
+    }
+    let candidates = [
+        "target/x86_64-unknown-linux-gnu/release/spritebox-fsd",
+        "target/x86_64-unknown-linux-gnu/debug/spritebox-fsd",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Err(format!(
+        "spritebox-fsd binary not found. Build it via:\n\
+         \tdocker run --rm -v \"$(pwd)\":/work -w /work rust:1 \\\n\
+         \t    cargo build --release -p spritebox-fsd --target x86_64-unknown-linux-gnu\n\
+         \tor pass --daemon <path>"
+    ))
+}
+
+/// Provision the sprite for FS sharing: chmod /dev/fuse, install the
+/// daemon binary, mkdir the mount point.
+async fn provision(
+    client: &SpritesClient,
+    sprite_name: &str,
+    daemon_path: &Path,
+    remote_mount: &str,
+) -> Result<(), String> {
+    eprintln!("ensuring /dev/fuse is openable...");
+    let r = client
+        .exec(sprite_name, &["sudo", "chmod", "666", "/dev/fuse"], &[], None)
+        .await?;
+    if r.exit_code != 0 {
+        return Err(format!(
+            "chmod /dev/fuse failed (exit={}): {}",
+            r.exit_code, r.stderr
+        ));
+    }
+
+    eprintln!("installing spritebox-fsd...");
+    let bytes = std::fs::read(daemon_path)
+        .map_err(|e| format!("read daemon binary: {e}"))?;
+    let r = client
+        .exec_with_stdin(
+            sprite_name,
+            &[
+                "bash",
+                "-c",
+                "cat > /usr/local/bin/spritebox-fsd && chmod +x /usr/local/bin/spritebox-fsd",
+            ],
+            &[],
+            None,
+            &bytes,
+        )
+        .await?;
+    if r.exit_code != 0 {
+        return Err(format!(
+            "install daemon failed (exit={}): {}",
+            r.exit_code, r.stderr
+        ));
+    }
+
+    eprintln!("creating mount point {remote_mount}...");
+    let r = client
+        .exec(
+            sprite_name,
+            &["mkdir", "-p", remote_mount],
+            &[],
+            None,
+        )
+        .await?;
+    if r.exit_code != 0 {
+        return Err(format!(
+            "mkdir {remote_mount} failed (exit={}): {}",
+            r.exit_code, r.stderr
+        ));
+    }
+    Ok(())
+}
+
+/// Run the share. Blocks until the WebSocket closes or the daemon exits.
+pub async fn run(
+    client: SpritesClient,
+    sprite_name: &str,
+    spec: ShareSpec,
+    daemon_override: Option<&Path>,
+) -> Result<(), String> {
+    let daemon = locate_daemon_binary(daemon_override)?;
+    eprintln!("daemon: {}", daemon.display());
+
+    provision(&client, sprite_name, &daemon, &spec.remote).await?;
+
+    eprintln!("opening exec WebSocket...");
+    let ws = client
+        .open_exec(
+            sprite_name,
+            &["/usr/local/bin/spritebox-fsd", "--mount", &spec.remote],
+            &[],
+            None,
+        )
+        .await?;
+    let (sink, stream) = ws.split();
+    let frame_sink = WsFrameSink::new(sink);
+    let mut frame_stream = WsFrameStream::new(stream);
+
+    // Host-side dispatcher backed by a TokioFs rooted at the local dir.
+    let host_fs = TokioFs::new(spec.local.clone());
+    let dispatcher = Dispatcher::new(host_fs);
+    let inodes = dispatcher.inodes();
+
+    // Single writer task owns the sink — both the dispatcher and the
+    // watcher push outgoing frames into a shared mpsc.
+    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
+    let frame_sink = Arc::new(Mutex::new(frame_sink));
+    let writer = tokio::spawn({
+        let frame_sink = frame_sink.clone();
+        async move {
+            while let Some(frame) = out_rx.recv().await {
+                let mut g = frame_sink.lock().await;
+                if g.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Watcher → Push frames.
+    let (push_tx, mut push_rx) = mpsc::channel(64);
+    let _watcher_guard = match watcher::spawn(
+        spec.local.clone(),
+        inodes,
+        push_tx,
+        WatcherConfig::default(),
+    ) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("warning: failed to start watcher: {e}");
+            None
+        }
+    };
+    let pusher = tokio::spawn({
+        let out_tx = out_tx.clone();
+        async move {
+            while let Some(push) = push_rx.recv().await {
+                if out_tx.send(Frame::Push(push)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    eprintln!("share running. ctrl-c to exit.");
+
+    // Main dispatch loop: receive requests from the daemon, dispatch,
+    // queue responses on out_tx.
+    let dispatcher = Arc::new(dispatcher);
+    while let Some(frame) = frame_stream.recv().await {
+        match frame {
+            Frame::Request { id, body } => {
+                let dispatcher = dispatcher.clone();
+                let out_tx = out_tx.clone();
+                tokio::spawn(async move {
+                    let resp = dispatcher.handle(id, body).await;
+                    let _ = out_tx.send(resp).await;
+                });
+            }
+            Frame::Response { .. } => {
+                // Daemon shouldn't send responses to us; ignore.
+            }
+            Frame::Push(_) => {
+                // Daemon shouldn't push to us; ignore.
+            }
+        }
+    }
+
+    eprintln!("daemon disconnected");
+    drop(out_tx); // close writer's channel
+    let _ = writer.await;
+    pusher.abort();
+    let _ = pusher.await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = format!("{}:/workspace/shared", tmp.path().display());
+        let parsed = ShareSpec::parse(&spec).unwrap();
+        assert_eq!(parsed.remote, "/workspace/shared");
+        assert_eq!(parsed.local, tmp.path());
+    }
+
+    #[test]
+    fn rejects_relative_local() {
+        assert!(ShareSpec::parse("relative/path:/workspace").is_err());
+    }
+
+    #[test]
+    fn rejects_relative_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = format!("{}:relative", tmp.path().display());
+        assert!(ShareSpec::parse(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_no_separator() {
+        assert!(ShareSpec::parse("/just/local").is_err());
+    }
+}

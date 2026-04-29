@@ -732,6 +732,52 @@ impl SpritesClient {
         }
     }
 
+    // -- Long-lived exec (for the FS share daemon) --------------------------
+
+    /// Open an exec WebSocket and return it ready for the caller to drive.
+    /// Used by long-running daemons where the lifecycle is managed by
+    /// higher-level code, not by the exec_inner exit-message loop.
+    pub async fn open_exec(
+        &self,
+        sprite_name: &str,
+        cmd: &[&str],
+        env: &[(&str, &str)],
+        dir: Option<&str>,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        String,
+    > {
+        let params = ExecParams {
+            sprite_name,
+            cmd,
+            env,
+            dir,
+            tty: false,
+            rows: None,
+            cols: None,
+        };
+        let url = self.build_exec_url(&params)?;
+        // Retry with exponential backoff for 30s — sprite may be cold.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self.connect_ws(&url).await {
+                Ok((ws, _)) => return Ok(ws),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    let backoff =
+                        std::time::Duration::from_secs(2u64.min(attempt as u64));
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
     // -- Helpers -------------------------------------------------------------
 
     /// Build structured args map for control connection op.start.
