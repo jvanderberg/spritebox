@@ -22,11 +22,13 @@ pub mod dispatch;
 pub mod inode_table;
 pub mod mem;
 pub mod tokio_fs;
+pub mod watcher;
 
 pub use dispatch::Dispatcher;
 pub use inode_table::InodeTable;
 pub use mem::MemFs;
 pub use tokio_fs::TokioFs;
+pub use watcher::{Watcher, WatcherConfig, WatcherError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostError {

@@ -106,8 +106,8 @@ fn open_flags_from(flags: i32) -> OpenFlags {
 ///
 /// Usage: `fuse_call!(self, span_name, ino_or_path, async_block, on_ok)`
 macro_rules! fuse_call {
-    ($self:expr, $span:expr, $tags:tt, $fut:expr, $reply:expr, $ok:expr) => {{
-        let span = tracing::info_span!($span; $tags);
+    ($self:expr, $span:expr, { $($field:tt)* }, $fut:expr, $reply:expr, $ok:expr) => {{
+        let span = tracing::info_span!($span, $($field)*);
         let _enter = span.enter();
         let t0 = std::time::Instant::now();
         let result = $self.runtime.block_on($fut);
