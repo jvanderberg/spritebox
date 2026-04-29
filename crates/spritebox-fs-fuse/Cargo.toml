@@ -1,0 +1,18 @@
+[package]
+name = "spritebox-fs-fuse"
+version = "0.1.0"
+edition = "2024"
+description = "FUSE adapter for the spritebox virtual filesystem (Linux only)"
+license = "MIT"
+
+[dependencies]
+spritebox-fs-protocol = { workspace = true }
+spritebox-fs-remote = { workspace = true }
+spritebox-fs-transport = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.15"
+libc = "0.2"

@@ -67,7 +67,6 @@ struct AttrEntry {
 #[derive(Debug, Clone)]
 enum LookupEntry {
     Found {
-        ino: Ino,
         attr: FileAttr,
         expires_at: Instant,
     },
@@ -212,7 +211,6 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
                 s.lookups.insert(
                     key,
                     LookupEntry::Found {
-                        ino: attr.ino,
                         attr: attr.clone(),
                         expires_at: now + self.config.lookup_ttl,
                     },
@@ -371,7 +369,6 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         s.lookups.insert(
             (parent, name.to_string()),
             LookupEntry::Found {
-                ino: attr.ino,
                 attr: attr.clone(),
                 expires_at: now + self.config.lookup_ttl,
             },
@@ -393,7 +390,6 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         s.lookups.insert(
             (parent, name.to_string()),
             LookupEntry::Found {
-                ino: attr.ino,
                 attr: attr.clone(),
                 expires_at: now + self.config.lookup_ttl,
             },
