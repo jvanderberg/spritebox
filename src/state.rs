@@ -31,7 +31,7 @@ pub fn sprite_name(
     }
 }
 
-fn repo_basename(repo: &str) -> String {
+pub fn repo_basename(repo: &str) -> String {
     let trimmed = repo.trim_end_matches('/');
     trimmed
         .rsplit(['/', ':'])
@@ -41,7 +41,7 @@ fn repo_basename(repo: &str) -> String {
         .to_string()
 }
 
-fn slugify(value: &str) -> String {
+pub fn slugify(value: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
 

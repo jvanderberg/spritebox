@@ -26,7 +26,6 @@ pub async fn run() -> Result<(), String> {
         Command::Exec(options) => exec_command(options).await,
         Command::Auth(cmd) => auth_command(cmd).await,
         Command::List => list_sprites().await,
-        Command::Stop(target) => stop(target).await,
         Command::Destroy(options) => destroy(options).await,
         Command::Doctor => doctor().await,
         Command::Help(text) => {
@@ -46,7 +45,6 @@ enum Command {
     Exec(ExecOptions),
     Auth(AuthCommand),
     List,
-    Stop(TargetOptions),
     Destroy(DestroyOptions),
     Doctor,
     Help(String),
@@ -91,6 +89,12 @@ struct LaunchOptions {
     /// Branch to check out inside the sprite.
     #[arg(long, requires = "repo")]
     branch: Option<String>,
+    /// Create the branch if it does not already exist on the remote.
+    #[arg(long, requires_all = ["repo", "branch"])]
+    new_branch: bool,
+    /// Base branch to use with --new-branch. Defaults to the remote's default branch.
+    #[arg(long, requires_all = ["repo", "branch"])]
+    from: Option<String>,
     /// Guest username to use inside the sprite.
     #[arg(long = "user", default_value_t = default_user())]
     user: String,
@@ -100,6 +104,10 @@ struct LaunchOptions {
     /// Do not install Codex in the sprite.
     #[arg(long)]
     no_codex: bool,
+    /// Run as a dispatch worker: poll the message board for tasks and run
+    /// them with `claude -p` instead of opening an interactive console.
+    #[arg(long, requires_all = ["repo", "branch"])]
+    dispatch: bool,
     /// Print verbose output.
     #[arg(long)]
     verbose: bool,
@@ -168,8 +176,6 @@ enum ClapCommand {
     Auth(ClapAuthCommand),
     /// List all sprites.
     List,
-    /// Stop a running sprite.
-    Stop(TargetOptions),
     /// Delete a sprite.
     Destroy(DestroyOptions),
     /// Check prerequisites.
@@ -208,7 +214,6 @@ impl Cli {
             Some(ClapCommand::Exec(options)) => Command::Exec(options),
             Some(ClapCommand::Auth(cmd)) => Command::Auth(cmd.command),
             Some(ClapCommand::List) => Command::List,
-            Some(ClapCommand::Stop(target)) => Command::Stop(target),
             Some(ClapCommand::Destroy(options)) => Command::Destroy(options),
             Some(ClapCommand::Doctor) => Command::Doctor,
             Some(ClapCommand::Help) => Command::Help(render_help()),
@@ -344,6 +349,19 @@ fi
     }
     install_bridge_scripts(&client, &sprite_name).await?;
 
+    // Register on the message board (host-side, no bridge needed)
+    if let (Some(repo), Some(branch)) = (options.repo.as_deref(), options.branch.as_deref()) {
+        use crate::msgboard::Board;
+        let board = Board::open(repo);
+        if let Err(e) = board.register(branch, &sprite_name) {
+            if options.verbose {
+                eprintln!("message board registration failed: {e}");
+            }
+        } else if options.verbose {
+            eprintln!("registered on message board");
+        }
+    }
+
     // Clone repo if needed
     if let (Some(repo), Some(branch)) = (options.repo.as_deref(), options.branch.as_deref()) {
         let gh_token = host_gh_auth_token()?;
@@ -363,8 +381,6 @@ fi
             .await?;
 
         if check.exit_code != 0 {
-            eprintln!("cloning {repo} (branch: {branch})...");
-
             // Convert SSH URL to HTTPS if we have GH_TOKEN
             let clone_url = if gh_token.is_some() {
                 ssh_to_https(repo)
@@ -372,21 +388,37 @@ fi
                 repo.to_string()
             };
 
+            // With --new-branch, clone the base branch then create the new branch.
+            // Without it, clone the target branch directly.
+            let clone_branch = if options.new_branch {
+                options.from.as_deref().unwrap_or("HEAD")
+            } else {
+                branch
+            };
+
+            let clone_branch_flag = if clone_branch == "HEAD" {
+                // No --branch flag: clone the remote's default branch
+                String::new()
+            } else {
+                format!(" --branch {}", shell_escape(clone_branch))
+            };
+
+            eprintln!("cloning {repo} (branch: {})...",
+                if options.new_branch { clone_branch } else { branch });
+
             // Set up git credential helper for GH_TOKEN if available
             let clone_script = if gh_token.is_some() {
                 format!(
-                    concat!(
-                        "git config --global credential.helper '!f() {{ echo \"password=$GH_TOKEN\"; }}; f' && ",
-                        "git clone --branch {branch} {url} /workspace && chown -R {user}:{user} /workspace"
-                    ),
-                    branch = shell_escape(branch),
+                    "git config --global credential.helper '!f() {{ echo \"password=$GH_TOKEN\"; }}; f' && \
+                     git clone{branch_flag} {url} /workspace && chown -R {user}:{user} /workspace",
+                    branch_flag = clone_branch_flag,
                     url = shell_escape(&clone_url),
                     user = options.user,
                 )
             } else {
                 format!(
-                    "git clone --branch {branch} {url} /workspace && chown -R {user}:{user} /workspace",
-                    branch = shell_escape(branch),
+                    "git clone{branch_flag} {url} /workspace && chown -R {user}:{user} /workspace",
+                    branch_flag = clone_branch_flag,
                     url = shell_escape(repo),
                     user = options.user,
                 )
@@ -403,6 +435,33 @@ fi
                     result.stderr
                 ));
             }
+
+            // Create and checkout the new branch if --new-branch
+            if options.new_branch {
+                eprintln!("creating branch {branch}...");
+                let new_branch_script = format!(
+                    "git config --global --add safe.directory /workspace && \
+                     cd /workspace && git checkout -b {branch}",
+                    branch = shell_escape(branch),
+                );
+                let result = client
+                    .exec(
+                        &sprite_name,
+                        &["bash", "-c", &new_branch_script],
+                        &env_vars,
+                        Some("/workspace"),
+                    )
+                    .await?;
+                if result.exit_code != 0 {
+                    return Err(format!(
+                        "branch creation failed (exit {}):\n{}{}",
+                        result.exit_code,
+                        result.stdout,
+                        result.stderr
+                    ));
+                }
+            }
+
             eprintln!("repo cloned to /workspace");
         } else if options.verbose {
             eprintln!("repo already cloned at /workspace");
@@ -482,32 +541,168 @@ fi
     )
     .await?;
 
-    // Open interactive console
-    let dir = if options.repo.is_some() {
-        Some("/workspace")
+    if options.dispatch {
+        // Dispatch loop: poll message board for leader tasks, run with claude -p
+        dispatch_loop(&client, &sprite_name, &options, &session_env).await
     } else {
-        None
-    };
-    eprintln!("connecting to {sprite_name}...");
+        // Open interactive console
+        let dir = if options.repo.is_some() {
+            Some("/workspace")
+        } else {
+            None
+        };
+        eprintln!("connecting to {sprite_name}...");
+        let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let shell = format!(
+            "exec sudo -u {user} -i bash -c 'stty rows {rows} cols {cols} 2>/dev/null; export COLUMNS={cols} LINES={rows}; cd {dir} && exec bash --login'",
+            user = options.user,
+            rows = term_rows,
+            cols = term_cols,
+            dir = if options.repo.is_some() { "/workspace" } else { "~" },
+        );
+        let env_refs: Vec<(&str, &str)> = session_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let code = client
+            .console_with_context(
+                &sprite_name,
+                &["bash", "-c", &shell],
+                &env_refs,
+                dir,
+                options.repo.as_deref(),
+                options.branch.as_deref(),
+            )
+            .await?;
+
+        // 130 = SIGINT (Ctrl-C), normal for interactive shells
+        if code != 0 && code != 130 {
+            return Err(format!("session exited with code {code}"));
+        }
+        Ok(())
+    }
+}
+
+/// Dispatch loop: install a dispatch script inside the sprite and run it via
+/// console so the user can see claude's output in real time.
+async fn dispatch_loop(
+    client: &SpritesClient,
+    sprite_name: &str,
+    options: &LaunchOptions,
+    session_env: &[(String, String)],
+) -> Result<(), String> {
+    let branch = options.branch.as_deref().ok_or("--dispatch requires --branch")?;
+
+    // Install the dispatch loop script inside the sprite
+    let dispatch_script = format!(
+        r#"#!/bin/bash
+# spritebox dispatch loop — polls message board, runs tasks with claude -p
+BRANCH="{branch}"
+
+echo "dispatch loop started (branch: $BRANCH)"
+echo "polling for leader tasks... (Ctrl+C to stop)"
+
+while true; do
+    tasks=$(sprite-msg from-leader 2>/dev/null)
+    if [ -z "$tasks" ] || [ "$tasks" = "[]" ]; then
+        sleep 10
+        continue
+    fi
+
+    # Extract task bodies (leader messages)
+    echo "$tasks" | jq -r '.[] | select(.leader_msg == true) | .body' | while IFS= read -r task_body; do
+        [ -z "$task_body" ] && continue
+
+        echo ""
+        echo "========================================"
+        echo "TASK: $task_body"
+        echo "========================================"
+        echo ""
+
+        sprite-msg send-leader "starting: $task_body"
+
+        claude --dangerously-skip-permissions -p "You are a worker agent on branch: $BRANCH
+
+## Your Task
+$task_body
+
+## Coordination
+You have access to a message board for coordination. All messages are
+direct (no broadcasts). Check regularly while you work.
+
+- sprite-msg new — check for new messages addressed to you
+- sprite-msg from-leader — check for instructions from the leader
+- sprite-msg send-leader \"your message\" — send a status update to the leader
+- sprite-msg send <branch> \"message\" — send a direct message to another branch
+- sprite-msg branches — see who else is working and on what
+
+Messages from the leader are your priority — treat them as directives.
+If another branch's work overlaps with yours, coordinate via sprite-msg send.
+
+Do NOT use sprite-msg leader-post. You are not the leader.
+
+## When Done
+Commit all changes with a descriptive message, then push:
+  git add -A && git commit -m \"description\" && git push
+
+Then exit. Do not wait for further instructions."
+        exit_code=$?
+
+        # Safety net: push in case claude forgot
+        cd /workspace && git push origin HEAD 2>/dev/null
+
+        if [ "$exit_code" -eq 0 ]; then
+            sprite-msg send-leader "completed: $task_body"
+        else
+            sprite-msg send-leader "error on task (exit $exit_code): $task_body"
+        fi
+
+        echo ""
+        echo "task finished (exit $exit_code), resuming poll..."
+    done
+done
+"#,
+        branch = branch,
+    );
+
+    client
+        .exec_with_stdin(
+            sprite_name,
+            &["bash", "-c", "cat > /usr/local/bin/spritebox-dispatch && chmod +x /usr/local/bin/spritebox-dispatch"],
+            &[],
+            None,
+            dispatch_script.as_bytes(),
+        )
+        .await?;
+
+    // Run the dispatch script via console so output streams to the terminal
+    eprintln!("connecting to {sprite_name} (dispatch mode)...");
+    let dir = Some("/workspace");
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let shell = format!(
-        "exec sudo -u {user} -i bash -c 'stty rows {rows} cols {cols} 2>/dev/null; export COLUMNS={cols} LINES={rows}; cd {dir} && exec bash --login'",
+        "exec sudo -u {user} -i bash -c 'stty rows {rows} cols {cols} 2>/dev/null; export COLUMNS={cols} LINES={rows}; cd /workspace && exec spritebox-dispatch'",
         user = options.user,
         rows = term_rows,
         cols = term_cols,
-        dir = if options.repo.is_some() { "/workspace" } else { "~" },
     );
     let env_refs: Vec<(&str, &str)> = session_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+
     let code = client
-        .console(&sprite_name, &["bash", "-c", &shell], &env_refs, dir)
+        .console_with_context(
+            sprite_name,
+            &["bash", "-c", &shell],
+            &env_refs,
+            dir,
+            options.repo.as_deref(),
+            options.branch.as_deref(),
+        )
         .await?;
 
-    // 130 = SIGINT (Ctrl-C), normal for interactive shells
     if code != 0 && code != 130 {
-        return Err(format!("session exited with code {code}"));
+        return Err(format!("dispatch loop exited with code {code}"));
     }
     Ok(())
 }
@@ -613,30 +808,6 @@ async fn list_sprites() -> Result<(), String> {
             sprite.status,
             sprite.url.as_deref().unwrap_or("-"),
         );
-    }
-    Ok(())
-}
-
-async fn stop(target: TargetOptions) -> Result<(), String> {
-    let client = create_client()?;
-    let sprite_name = state::sprite_name(
-        target.name.as_deref(),
-        target.repo.as_deref(),
-        target.branch.as_deref(),
-    )?;
-
-    let existing = client.get_sprite(&sprite_name).await?;
-    match existing {
-        None => {
-            println!("no sprite named {sprite_name}");
-        }
-        Some(info) if info.status == "stopped" || info.status == "sleeping" => {
-            println!("{sprite_name} is already stopped");
-        }
-        Some(_) => {
-            client.stop_sprite(&sprite_name).await?;
-            println!("stopped {sprite_name}");
-        }
     }
     Ok(())
 }
@@ -904,6 +1075,10 @@ to port 8080. Use `sprite-env services create` with `--http-port` to route to
 a different port. To open the URL on the host, use `sprite-browser $SPRITE_URL`.
 Never tell the user to visit `localhost` — use the sprite URL instead.
 
+## Message Board
+
+{msgboard_section}
+
 ## Important
 
 - This is a Linux VM, not macOS. GUI tools don't work here.
@@ -915,6 +1090,28 @@ Never tell the user to visit `localhost` — use the sprite URL instead.
 "#,
         sprite_name = sprite_name,
         url_line = url_line,
+        msgboard_section = r#"This sprite is part of a multi-branch coordination system.
+All messages are direct (no broadcasts) — each message has a specific recipient.
+
+Commands:
+- `sprite-msg branches` — list all active branches and which is the leader
+- `sprite-msg list` — read messages addressed to you (or sent by you)
+- `sprite-msg new` — read only new messages since you last checked
+- `sprite-msg from-leader` — read new messages from the leader branch
+- `sprite-msg send <branch> "message"` — send a direct message to a specific branch
+- `sprite-msg send-leader "message"` — send a direct message to the current leader
+- `sprite-msg leader-post "task"` — send a task to ALL branches as the leader (picked up by dispatch workers)
+- `sprite-msg set-leader` — claim the leader role for your branch
+
+Only use `sprite-msg leader-post` if you have been told you are the leader.
+Dispatch workers poll for leader messages and run them as tasks automatically.
+
+To review work on other branches:
+  git fetch origin <branch>
+  git diff main..origin/<branch>
+  git log origin/<branch> --oneline -10
+
+All commands return JSON to stdout."#,
     );
 
     let user_home = format!("/home/{user}");
@@ -1094,133 +1291,113 @@ echo "opening $path on host..."
         )
         .await?;
 
-    Ok(())
+    // sprite-msg — message board commands via bridge escape sequences
+    // NOTE: The response file is written by root (via the Sprites exec API).
+    // /tmp has the sticky bit, so only root can delete root-owned files there.
+    // We use a user-owned marker file + `-nt` (newer-than) test to detect
+    // fresh responses instead of trying to rm the response file.
+    let msg_script = r#"#!/bin/bash
+# sprite-msg — message board coordination via host bridge
+RESPONSE_FILE="/tmp/spritebox-msg-response.json"
+MARKER_FILE="/tmp/spritebox-msg-marker-$(id -u)"
+usage() {
+  echo "usage: sprite-msg <command> [args]" >&2
+  echo "commands: send, send-leader, leader-post, branches, list, new, from-leader, set-leader" >&2
+  exit 2
 }
+[ "$#" -lt 1 ] && usage
+CMD="$1"
+shift
+case "$CMD" in
+  leader-post)
+    [ "$#" -lt 1 ] && { echo "usage: sprite-msg leader-post <message>" >&2; exit 2; }
+    VERB="msg-leader-post"
+    PAYLOAD="$*"
+    ;;
+  send)
+    [ "$#" -lt 2 ] && { echo "usage: sprite-msg send <branch> <message>" >&2; exit 2; }
+    TO="$1"
+    shift
+    VERB="msg-send"
+    PAYLOAD="$TO;$*"
+    ;;
+  send-leader)
+    [ "$#" -lt 1 ] && { echo "usage: sprite-msg send-leader <message>" >&2; exit 2; }
+    VERB="msg-send-leader"
+    PAYLOAD="$*"
+    ;;
+  branches|list|new|from-leader|set-leader)
+    VERB="msg-$CMD"
+    PAYLOAD=""
+    ;;
+  *) usage ;;
+esac
+# Touch a marker file BEFORE sending the request.
+# The response file is root-owned (written by host bridge via exec API)
+# and cannot be deleted from /tmp (sticky bit). Instead we poll until
+# the response file is newer than this marker.
+touch "$MARKER_FILE"
+# Emit OSC 9999 escape sequence
+emit_escape() {
+  if [ -n "$PAYLOAD" ]; then
+    printf '\033]9999;%s;%s\033\\' "$VERB" "$PAYLOAD" > "$1"
+  else
+    printf '\033]9999;%s;\033\\' "$VERB" > "$1"
+  fi
+}
+sent=false
+if ( emit_escape /dev/tty ) 2>/dev/null; then
+  sent=true
+else
+  pid=$$
+  while [ "$pid" != "1" ] && [ -n "$pid" ]; do
+    tty_dev=$(readlink /proc/"$pid"/fd/1 2>/dev/null || true)
+    case "$tty_dev" in
+      /dev/pts/*|/dev/tty*)
+        emit_escape "$tty_dev"
+        sent=true
+        break
+        ;;
+    esac
+    pid=$(awk '{print $4}' /proc/"$pid"/stat 2>/dev/null || echo 1)
+  done
+fi
+if [ "$sent" = false ]; then
+  echo '{"error":"no TTY found to emit bridge escape sequence"}' >&2
+  rm -f "$MARKER_FILE"
+  exit 1
+fi
+# Poll until response file is newer than our marker (up to 15s)
+waited=0
+found=false
+while [ "$waited" -lt 30 ]; do
+  if [ -f "$RESPONSE_FILE" ] && [ "$RESPONSE_FILE" -nt "$MARKER_FILE" ]; then
+    found=true
+    break
+  fi
+  sleep 0.5
+  waited=$((waited + 1))
+done
+rm -f "$MARKER_FILE"
+if [ "$found" = true ]; then
+  cat "$RESPONSE_FILE"
+  echo
+  exit 0
+else
+  echo '{"error":"timed out waiting for response (15s)"}' >&2
+  exit 1
+fi
+"#;
+    client
+        .exec_with_stdin(
+            sprite_name,
+            &["bash", "-c", "cat > /usr/local/bin/sprite-msg && chmod +x /usr/local/bin/sprite-msg"],
+            &[],
+            None,
+            msg_script.as_bytes(),
+        )
+        .await?;
 
-async fn install_tools(
-    client: &SpritesClient,
-    sprite_name: &str,
-    options: &LaunchOptions,
-) -> Result<(), String> {
-    let mut packages: Vec<&str> = Vec::new();
-    if !options.no_claude {
-        packages.push("@anthropic-ai/claude-code");
-    }
-    if !options.no_codex {
-        packages.push("@openai/codex");
-    }
-    if packages.is_empty() {
-        return Ok(());
-    }
-
-    // Check which packages are already installed (verify via npm list, not just which)
-    let mut to_install: Vec<&str> = Vec::new();
-    for pkg in &packages {
-        let check_cmd = format!("npm list -g {pkg} 2>/dev/null | grep -q {pkg}");
-        let check = client
-            .exec(sprite_name, &["bash", "-c", &check_cmd], &[], None)
-            .await?;
-        if check.exit_code != 0 {
-            to_install.push(pkg);
-        }
-    }
-
-    if to_install.is_empty() {
-        if options.verbose {
-            eprintln!("dev tools already installed");
-        }
-        return Ok(());
-    }
-
-    // Ensure a modern Node.js is available (claude-code needs 18+)
-    let need_node = {
-        let check = client
-            .exec(sprite_name, &["bash", "-c", "node --version 2>/dev/null | sed 's/v//'"], &[], None)
-            .await?;
-        if check.exit_code != 0 {
-            true
-        } else {
-            let ver = check.stdout.trim().to_string();
-            let major: u32 = ver.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            major < 18
-        }
-    };
-
-    if need_node {
-        eprintln!("installing node.js 22...");
-        let install_node = concat!(
-            "curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null 2>&1",
-            " && apt-get install -y -qq nodejs > /dev/null 2>&1"
-        );
-        let result = client
-            .exec(sprite_name, &["bash", "-c", install_node], &[], None)
-            .await?;
-        if result.exit_code != 0 {
-            return Err(format!(
-                "failed to install node.js (exit {}):\n{}{}",
-                result.exit_code, result.stdout, result.stderr
-            ));
-        }
-    }
-
-    let pkg_list = to_install.join(" ");
-    eprintln!("installing {pkg_list} (this may take a minute)...");
-    let install_cmd = format!(
-        concat!(
-            "apt-get install -y -qq bubblewrap > /dev/null 2>&1;",
-            " npm install -g {pkgs} 2>&1",
-            " && NODE_BIN=$(which node)",
-            " && [ -n \"$NODE_BIN\" ] && ln -sf \"$NODE_BIN\" /usr/local/bin/node",
-            " && NPM_BIN=$(npm prefix -g)/bin",
-            " && for bin in claude codex; do",
-            "   [ -f \"$NPM_BIN/$bin\" ] && ln -sf \"$NPM_BIN/$bin\" /usr/local/bin/$bin;",
-            " done",
-        ),
-        pkgs = pkg_list,
-    );
-
-    // Run install with a spinner since it takes a while
-    let client2 = client.clone();
-    let name2 = sprite_name.to_string();
-    let mut handle = tokio::spawn(async move {
-        client2
-            .exec_with_timeout(
-                &name2,
-                &["bash", "-c", &install_cmd],
-                &[],
-                None,
-                &[],
-                std::time::Duration::from_secs(300),
-            )
-            .await
-    });
-
-    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let start = std::time::Instant::now();
-    let mut frame = 0usize;
-    loop {
-        tokio::select! {
-            result = &mut handle => {
-                eprint!("\r\x1b[K");
-                let result = result.map_err(|e| format!("install task failed: {e}"))??;
-                if result.exit_code != 0 {
-                    return Err(format!(
-                        "failed to install tools (exit {}):\n{}{}",
-                        result.exit_code, result.stdout, result.stderr
-                    ));
-                }
-                break;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                let elapsed = start.elapsed().as_secs();
-                let ch = SPINNER[frame % SPINNER.len()];
-                eprint!("\r{ch} installing... {elapsed}s");
-                frame += 1;
-            }
-        }
-    }
-
-    eprintln!("dev tools installed");
     Ok(())
 }
 

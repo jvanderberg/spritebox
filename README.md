@@ -29,7 +29,7 @@ auto-sleep after 30 seconds of inactivity, and wake automatically when you recon
 Storage persists across sleep/wake cycles.
 
 spritebox handles:
-- Sprite lifecycle (create, connect, stop, destroy)
+- Sprite lifecycle (create, connect, destroy)
 - User provisioning (matching your local username)
 - Git clone and credential setup (HTTPS via GH_TOKEN)
 - Config sync (Claude, Codex, GitHub configs pushed from host)
@@ -96,7 +96,6 @@ spritebox exec --repo git@github.com:org/repo.git --branch main -- ls /workspace
 
 ```bash
 spritebox list                                              # all sprites and their status
-spritebox stop --name repo-main                             # stop a running sprite
 spritebox destroy --name repo-main                          # delete a sprite
 spritebox destroy --repo git@github.com:org/repo.git --branch main --yes
 ```

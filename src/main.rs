@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod git;
+mod msgboard;
 mod sprites_api;
 mod state;
 
