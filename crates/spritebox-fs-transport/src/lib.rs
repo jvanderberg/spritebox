@@ -33,9 +33,11 @@ use tokio::sync::{Mutex, mpsc};
 
 pub mod clock;
 pub mod stdio;
+pub mod ws;
 
 pub use clock::{FakeClock, RealClock, TransportClock};
 pub use stdio::{StdioSink, StdioStream};
+pub use ws::{WsFrameSink, WsFrameStream};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
