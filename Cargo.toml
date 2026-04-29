@@ -5,6 +5,7 @@ members = [
     "crates/spritebox-fs-host",
     "crates/spritebox-fs-transport",
     "crates/spritebox-fs-remote",
+    "crates/spritebox-fs-tests",
 ]
 
 [workspace.dependencies]
@@ -15,6 +16,7 @@ async-trait = "0.1"
 spritebox-fs-protocol = { path = "crates/spritebox-fs-protocol" }
 spritebox-fs-transport = { path = "crates/spritebox-fs-transport" }
 spritebox-fs-host = { path = "crates/spritebox-fs-host" }
+spritebox-fs-remote = { path = "crates/spritebox-fs-remote" }
 
 [package]
 name = "spritebox"

@@ -1359,6 +1359,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "spritebox-fs-tests"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "spritebox-fs-host",
+ "spritebox-fs-protocol",
+ "spritebox-fs-remote",
+ "spritebox-fs-transport",
+ "tokio",
+]
+
+[[package]]
 name = "spritebox-fs-transport"
 version = "0.1.0"
 dependencies = [

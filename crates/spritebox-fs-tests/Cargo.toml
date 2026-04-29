@@ -1,0 +1,16 @@
+[package]
+name = "spritebox-fs-tests"
+version = "0.1.0"
+edition = "2024"
+description = "Integration tests and harness for the spritebox virtual filesystem"
+license = "MIT"
+publish = false
+
+[dependencies]
+spritebox-fs-protocol = { workspace = true }
+spritebox-fs-transport = { workspace = true }
+spritebox-fs-host = { workspace = true }
+spritebox-fs-remote = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
