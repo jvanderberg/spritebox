@@ -32,8 +32,10 @@ use spritebox_fs_protocol::{Frame, RequestId};
 use tokio::sync::{Mutex, mpsc};
 
 pub mod clock;
+pub mod stdio;
 
 pub use clock::{FakeClock, RealClock, TransportClock};
+pub use stdio::{StdioSink, StdioStream};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {

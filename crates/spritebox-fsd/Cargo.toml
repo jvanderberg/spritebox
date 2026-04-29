@@ -1,0 +1,23 @@
+[package]
+name = "spritebox-fsd"
+version = "0.1.0"
+edition = "2024"
+description = "Sprite-side daemon: mounts FUSE and forwards over stdio to the host"
+license = "MIT"
+
+[[bin]]
+name = "spritebox-fsd"
+path = "src/main.rs"
+
+[dependencies]
+spritebox-fs-protocol = { workspace = true }
+spritebox-fs-transport = { workspace = true }
+spritebox-fs-remote = { workspace = true }
+spritebox-fs-fuse = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }

@@ -7,6 +7,7 @@ members = [
     "crates/spritebox-fs-remote",
     "crates/spritebox-fs-tests",
     "crates/spritebox-fs-fuse",
+    "crates/spritebox-fsd",
 ]
 
 [workspace.dependencies]
@@ -18,6 +19,7 @@ spritebox-fs-protocol = { path = "crates/spritebox-fs-protocol" }
 spritebox-fs-transport = { path = "crates/spritebox-fs-transport" }
 spritebox-fs-host = { path = "crates/spritebox-fs-host" }
 spritebox-fs-remote = { path = "crates/spritebox-fs-remote" }
+spritebox-fs-fuse = { path = "crates/spritebox-fs-fuse" }
 tracing = "0.1"
 
 [package]
