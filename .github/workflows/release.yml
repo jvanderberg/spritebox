@@ -1,0 +1,118 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  daemon:
+    name: build daemon (linux/x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: daemon-${{ github.ref_name }}
+      - name: build spritebox-fsd
+        run: cargo build --release -p spritebox-fsd --target x86_64-unknown-linux-gnu
+      - name: upload daemon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spritebox-fsd
+          path: target/x86_64-unknown-linux-gnu/release/spritebox-fsd
+          retention-days: 1
+
+  cli:
+    name: build cli (${{ matrix.target }})
+    needs: daemon
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: spritebox-linux-x86_64
+            ext: ''
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: spritebox-macos-aarch64
+            ext: ''
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: spritebox-macos-x86_64
+            ext: ''
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            asset: spritebox-windows-x86_64
+            ext: '.exe'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}-${{ github.ref_name }}
+      - name: download daemon artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spritebox-fsd
+          path: artifacts
+      - name: locate daemon (unix)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x artifacts/spritebox-fsd
+          echo "SPRITEBOX_FSD_BIN=$PWD/artifacts/spritebox-fsd" >> $GITHUB_ENV
+      - name: locate daemon (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "SPRITEBOX_FSD_BIN=$pwd\artifacts\spritebox-fsd" >> $env:GITHUB_ENV
+      - name: build cli
+        run: cargo build --release --target ${{ matrix.target }} --bin spritebox
+      - name: stage artifact (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp "target/${{ matrix.target }}/release/spritebox" "${{ matrix.asset }}${{ matrix.ext }}"
+          ls -la "${{ matrix.asset }}${{ matrix.ext }}"
+      - name: stage artifact (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/spritebox.exe" "${{ matrix.asset }}${{ matrix.ext }}"
+          Get-Item "${{ matrix.asset }}${{ matrix.ext }}"
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}${{ matrix.ext }}
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: cli
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: download all cli artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: list artifacts
+        run: |
+          find artifacts -type f -exec ls -la {} \;
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/spritebox-*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
