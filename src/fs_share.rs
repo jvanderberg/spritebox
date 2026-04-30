@@ -4,13 +4,14 @@
 //! mount point. On invocation:
 //!
 //! 1. Ensure /dev/fuse is openable on the sprite (`chmod 666`).
-//! 2. Push the cross-compiled `spritebox-fsd` binary to the sprite.
-//! 3. mkdir the mount point.
-//! 4. Open an exec WebSocket running the daemon.
-//! 5. Wrap the WS as a `FrameSink`/`FrameStream` pair.
-//! 6. Run the host-side `Dispatcher` backed by a `TokioFs` rooted at the
+//! 2. Enable `user_allow_other` in `/etc/fuse.conf`.
+//! 3. Push the cross-compiled `spritebox-fsd` binary to the sprite.
+//! 4. mkdir the mount point.
+//! 5. Open an exec WebSocket running the daemon.
+//! 6. Wrap the WS as a `FrameSink`/`FrameStream` pair.
+//! 7. Run the host-side `Dispatcher` backed by a `TokioFs` rooted at the
 //!    local directory; serve `Frame::Request`s from the daemon.
-//! 7. Spawn a `notify` watcher on the local directory that pushes
+//! 8. Spawn a `notify` watcher on the local directory that pushes
 //!    `Push` frames back to the sprite as files change.
 //!
 //! The daemon binary must be pre-built for `x86_64-unknown-linux-gnu`
@@ -96,8 +97,9 @@ fn locate_daemon_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
     ))
 }
 
-/// Provision the sprite for FS sharing: chmod /dev/fuse, install the
-/// daemon binary, mkdir the mount point.
+/// Provision the sprite for FS sharing: chmod /dev/fuse, enable
+/// `user_allow_other`, install the daemon binary, mkdir the mount
+/// point.
 async fn provision(
     client: &SpritesClient,
     sprite_name: &str,
@@ -111,6 +113,27 @@ async fn provision(
     if r.exit_code != 0 {
         return Err(format!(
             "chmod /dev/fuse failed (exit={}): {}",
+            r.exit_code, r.stderr
+        ));
+    }
+
+    eprintln!("ensuring /etc/fuse.conf enables user_allow_other...");
+    let r = client
+        .exec(
+            sprite_name,
+            &[
+                "sudo",
+                "sh",
+                "-c",
+                "grep -qxF user_allow_other /etc/fuse.conf 2>/dev/null || printf '%s\\n' user_allow_other >> /etc/fuse.conf",
+            ],
+            &[],
+            None,
+        )
+        .await?;
+    if r.exit_code != 0 {
+        return Err(format!(
+            "enable user_allow_other failed (exit={}): {}",
             r.exit_code, r.stderr
         ));
     }
@@ -142,7 +165,7 @@ async fn provision(
     let r = client
         .exec(
             sprite_name,
-            &["mkdir", "-p", remote_mount],
+            &["sudo", "mkdir", "-p", remote_mount],
             &[],
             None,
         )
@@ -171,14 +194,20 @@ pub async fn prepare(
     provision(&client, sprite_name, &daemon, &spec.remote).await?;
 
     eprintln!("opening exec WebSocket...");
+    // The daemon needs CAP_SYS_ADMIN to mount FUSE; run under sudo so it
+    // executes as root. Stderr is captured to /tmp/spritebox-fsd.log so
+    // it survives even if the WS doesn't relay 0x02 frames in this
+    // session mode.
     let ws = client
         .open_exec(
             sprite_name,
             &[
-                "/usr/local/bin/spritebox-fsd",
-                "--mount",
+                "sh",
+                "-c",
+                "exec sudo -E sh -c 'exec /usr/local/bin/spritebox-fsd \
+                 --mount \"$1\" --verbose 2>>/tmp/spritebox-fsd.log' \
+                 sh \"$0\"",
                 &spec.remote,
-                "--verbose",
             ],
             &[("RUST_LOG", "info")],
             None,

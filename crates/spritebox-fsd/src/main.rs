@@ -50,6 +50,8 @@ fn main() -> Result<(), String> {
         .with_writer(std::io::stderr)
         .init();
 
+    eprintln!("[fsd-stderr] starting; mount={} verbose={}", args.mount.display(), args.verbose);
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -79,9 +81,12 @@ async fn run_fuse(
     use spritebox_fs_fuse::SpriteboxFs;
 
     let fs = SpriteboxFs::new(runtime, remote);
+    // We run as root (via sudo from the host) but the user's shell runs
+    // as a non-root user; AllowOther lets that user access the mount.
+    // Requires `user_allow_other` in /etc/fuse.conf, which the host's
+    // provision step ensures.
     let options = vec![
         fuser::MountOption::FSName("spritebox".into()),
-        fuser::MountOption::AutoUnmount,
         fuser::MountOption::AllowOther,
     ];
     tokio::task::spawn_blocking({
