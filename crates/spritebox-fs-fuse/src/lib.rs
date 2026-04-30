@@ -143,6 +143,32 @@ macro_rules! fuse_call {
 }
 
 impl Filesystem for SpriteboxFs {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        // Opt in to readdirplus. fuser 0.15's defaults DON'T include
+        // FUSE_DO_READDIRPLUS, which means the kernel issues
+        // readdir + N × LOOKUP for `ls -la` even though we implement
+        // the readdirplus callback. Without these capabilities a
+        // 100-file dir is 100+ WAN round-trips per `ls`.
+        //
+        // FUSE_DO_READDIRPLUS: tell the kernel readdirplus is supported
+        // FUSE_READDIRPLUS_AUTO: let the kernel pick readdirplus vs
+        //   readdir based on the access pattern (saves the
+        //   per-entry-attr cost when stats aren't actually needed)
+        let want = fuser::consts::FUSE_DO_READDIRPLUS
+            | fuser::consts::FUSE_READDIRPLUS_AUTO;
+        if let Err(unsupported) = config.add_capabilities(want) {
+            tracing::warn!(
+                unsupported,
+                "kernel rejected requested FUSE capabilities"
+            );
+        }
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s.to_string(),
