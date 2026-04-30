@@ -143,6 +143,7 @@ impl<S: FrameSink> CachedRemote<S> {
             attr_entries: s.attrs.len(),
             lookup_entries: s.lookups.len(),
             content_chunks: s.content.len(),
+            content_bytes: s.content.bytes_used(),
             hits_attr: s.hits_attr,
             misses_attr: s.misses_attr,
             hits_lookup: s.hits_lookup,
@@ -151,6 +152,7 @@ impl<S: FrameSink> CachedRemote<S> {
             hits_content: s.content.hits,
             misses_content: s.content.misses,
             evictions_content: s.content.evictions,
+            bytes_evicted_content: s.content.bytes_evicted,
             stale_fetches_dropped: s.stale_fetches_dropped,
         }
     }
@@ -169,7 +171,9 @@ pub struct CacheStats {
     pub hits_content: u64,
     pub misses_content: u64,
     pub evictions_content: u64,
+    pub bytes_evicted_content: u64,
     pub stale_fetches_dropped: u64,
+    pub content_bytes: usize,
 }
 
 fn apply_push(s: &mut CacheState, push: Push) {
@@ -741,7 +745,7 @@ mod tests {
         let cfg = CacheConfig {
             content: ContentCacheConfig {
                 chunk_size: 16,
-                max_chunks: 8,
+                max_bytes: 16 * 8,
             },
             ..Default::default()
         };
@@ -770,7 +774,7 @@ mod tests {
         let cfg = CacheConfig {
             content: ContentCacheConfig {
                 chunk_size: 16,
-                max_chunks: 8,
+                max_bytes: 16 * 8,
             },
             ..Default::default()
         };
@@ -794,7 +798,7 @@ mod tests {
         let cfg = CacheConfig {
             content: ContentCacheConfig {
                 chunk_size: 16,
-                max_chunks: 2,
+                max_bytes: 16 * 2,
             },
             ..Default::default()
         };
@@ -819,7 +823,7 @@ mod tests {
         let cfg = CacheConfig {
             content: ContentCacheConfig {
                 chunk_size: 16,
-                max_chunks: 8,
+                max_bytes: 16 * 8,
             },
             ..Default::default()
         };
@@ -868,7 +872,7 @@ mod tests {
         let cfg = CacheConfig {
             content: ContentCacheConfig {
                 chunk_size: 16,
-                max_chunks: 8,
+                max_bytes: 16 * 8,
             },
             ..Default::default()
         };
@@ -916,7 +920,7 @@ mod tests {
         let cfg = CacheConfig {
             content: ContentCacheConfig {
                 chunk_size: 16,
-                max_chunks: 4,
+                max_bytes: 16 * 4,
             },
             ..Default::default()
         };
