@@ -59,6 +59,16 @@ pub struct DirEntry {
     pub kind: FileKind,
 }
 
+/// Variant of [`DirEntry`] used by `ReadDirPlus`. Carries the full
+/// [`FileAttr`] alongside the name/kind so a single round-trip
+/// satisfies the kernel's batched LOOKUP+GETATTR for `ls -la`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntryPlus {
+    pub name: String,
+    pub kind: FileKind,
+    pub attr: FileAttr,
+}
+
 /// Open-flag subset we honor. Mapped from FUSE/POSIX open flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenFlags {
@@ -82,6 +92,13 @@ pub enum Request {
         ino: Ino,
     },
     ReadDir {
+        ino: Ino,
+        offset: u64,
+    },
+    /// Read directory with full attrs for each entry (FUSE readdirplus).
+    /// One round-trip replaces `readdir + N × (lookup + getattr)` —
+    /// critical for `ls -la` over a constrained-bandwidth WAN.
+    ReadDirPlus {
         ino: Ino,
         offset: u64,
     },
@@ -196,6 +213,12 @@ pub enum Response {
     },
     DirPage {
         entries: Vec<DirEntry>,
+        next_offset: Option<u64>,
+    },
+    DirPagePlus {
+        /// Each entry carries its full FileAttr — note FileAttr.ino is
+        /// the inode the host has assigned for that entry.
+        entries: Vec<DirEntryPlus>,
         next_offset: Option<u64>,
     },
     OpenOk {

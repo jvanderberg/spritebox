@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use spritebox_fs_protocol::{
-    DirEntry, Errno, FileAttr, Frame, Ino, OpenFlags, Push, Request, RequestId, Response, StatFs,
+    DirEntry, DirEntryPlus, Errno, FileAttr, Frame, Ino, OpenFlags, Push, Request, RequestId,
+    Response, StatFs,
     errno as e,
 };
 use spritebox_fs_transport::{FrameSink, FrameStream};
@@ -59,6 +60,12 @@ pub type ClientResult<T> = Result<T, ClientError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirPage {
     pub entries: Vec<DirEntry>,
+    pub next_offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirPagePlus {
+    pub entries: Vec<DirEntryPlus>,
     pub next_offset: Option<u64>,
 }
 
@@ -158,6 +165,10 @@ pub trait RemoteFs: Send + Sync + 'static {
     async fn lookup(&self, parent: Ino, name: &str) -> ClientResult<FileAttr>;
     async fn getattr(&self, ino: Ino) -> ClientResult<FileAttr>;
     async fn readdir(&self, ino: Ino, offset: u64) -> ClientResult<DirPage>;
+    /// Read directory and return per-entry attrs inline. Used by the
+    /// FUSE adapter's `readdirplus` callback to satisfy `ls -la` in
+    /// one round-trip.
+    async fn readdirplus(&self, ino: Ino, offset: u64) -> ClientResult<DirPagePlus>;
     async fn open(&self, ino: Ino, flags: OpenFlags) -> ClientResult<u64>;
     async fn release(&self, ino: Ino, handle: u64) -> ClientResult<()>;
     async fn read(
@@ -265,6 +276,24 @@ impl<S: FrameSink> RemoteFs for PassthroughRemote<S> {
                 entries,
                 next_offset,
             } => Ok(DirPage {
+                entries,
+                next_offset,
+            }),
+            Response::Error { errno } => Err(ClientError::Errno(errno)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    async fn readdirplus(
+        &self,
+        ino: Ino,
+        offset: u64,
+    ) -> ClientResult<DirPagePlus> {
+        match self.req(Request::ReadDirPlus { ino, offset }).await? {
+            Response::DirPagePlus {
+                entries,
+                next_offset,
+            } => Ok(DirPagePlus {
                 entries,
                 next_offset,
             }),

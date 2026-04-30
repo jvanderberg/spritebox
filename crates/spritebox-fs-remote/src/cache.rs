@@ -381,6 +381,39 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         self.inner.readdir(ino, offset).await
     }
 
+    async fn readdirplus(
+        &self,
+        ino: Ino,
+        offset: u64,
+    ) -> ClientResult<crate::DirPagePlus> {
+        // Pass through to the host, then populate the lookup + attr
+        // caches with each entry's data so subsequent per-entry
+        // lookup/getattr calls hit local cache. This is the entire
+        // point of readdirplus — and the cache primer is what makes
+        // `cd` / `ls` / `find` stay snappy after the initial call.
+        let page = self.inner.readdirplus(ino, offset).await?;
+        let now = Instant::now();
+        let mut s = self.state.lock().await;
+        for entry in &page.entries {
+            s.lookups.insert(
+                (ino, entry.name.clone()),
+                LookupEntry::Found {
+                    attr: entry.attr.clone(),
+                    expires_at: now + self.config.lookup_ttl,
+                },
+            );
+            s.attrs.insert(
+                entry.attr.ino,
+                AttrEntry {
+                    attr: entry.attr.clone(),
+                    expires_at: now + self.config.attr_ttl,
+                },
+            );
+        }
+        drop(s);
+        Ok(page)
+    }
+
     async fn open(&self, ino: Ino, flags: OpenFlags) -> ClientResult<u64> {
         self.inner.open(ino, flags).await
     }

@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{
     FileAttr as FuseAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use spritebox_fs_protocol::{
     FileAttr as PAttr, FileKind, Ino, OpenFlags, ROOT_INO, errno as e,
@@ -310,6 +310,51 @@ impl Filesystem for SpriteboxFs {
                 }
                 Err(err) => {
                     reply.error(errno_for(&err));
+                }
+            }
+        });
+    }
+
+    /// Implementing readdirplus tells the kernel it can ask for
+    /// directory entries with their attrs in a single round-trip,
+    /// turning `ls -la` from N+1 round-trips into 1.
+    fn readdirplus(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let remote = self.remote.clone();
+        let span = tracing::info_span!("fuse.readdirplus", ino, offset);
+        self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let result = remote.readdirplus(ino as Ino, offset as u64).await;
+            match result {
+                Ok(page) => {
+                    tracing::info!(entries = page.entries.len(), "ok");
+                    let mut idx = offset as u64;
+                    for entry in page.entries {
+                        idx += 1;
+                        let attr = to_fuse_attr(&entry.attr);
+                        if reply.add(
+                            entry.attr.ino,
+                            idx as i64,
+                            &entry.name,
+                            &ENTRY_TTL,
+                            &attr,
+                            GENERATION,
+                        ) {
+                            break;
+                        }
+                    }
+                    reply.ok();
+                }
+                Err(err) => {
+                    let errno = errno_for(&err);
+                    tracing::warn!(errno, "err");
+                    reply.error(errno);
                 }
             }
         });

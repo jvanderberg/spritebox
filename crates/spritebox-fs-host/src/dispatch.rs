@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use spritebox_fs_protocol::{
-    DirEntry, FileAttr, FileKind, Frame, Ino, OpenFlags, Push, Request, RequestId, Response,
-    StatFs,
+    DirEntry, DirEntryPlus, FileAttr, FileKind, Frame, Ino, OpenFlags, Push, Request, RequestId,
+    Response, StatFs,
     errno::{self as e},
 };
 use std::collections::HashMap;
@@ -129,6 +129,7 @@ impl<F: HostFs> Dispatcher<F> {
             Request::Lookup { parent, name } => self.lookup(parent, &name).await,
             Request::GetAttr { ino } => self.getattr(ino).await,
             Request::ReadDir { ino, offset } => self.readdir(ino, offset).await,
+            Request::ReadDirPlus { ino, offset } => self.readdirplus(ino, offset).await,
             Request::Open { ino, flags } => self.open(ino, flags).await,
             Request::Release { handle, .. } => self.release(handle).await,
             Request::Read {
@@ -240,6 +241,60 @@ impl<F: HostFs> Dispatcher<F> {
             })
             .collect();
         Response::DirPage {
+            entries,
+            next_offset: None,
+        }
+    }
+
+    /// Like `readdir` but stat each child and return their full attrs
+    /// inline. One round-trip replaces N round-trips for `ls -la`.
+    async fn readdirplus(
+        &self,
+        ino: spritebox_fs_protocol::Ino,
+        offset: u64,
+    ) -> Response {
+        let path = match self.resolve_ino(ino).await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let children = match self.fs.list_dir(&path).await {
+            Ok(c) => c,
+            Err(err) => return Response::Error { errno: err.errno() },
+        };
+        let start = offset as usize;
+        if start >= children.len() {
+            return Response::DirPagePlus {
+                entries: Vec::new(),
+                next_offset: None,
+            };
+        }
+        let mut entries: Vec<DirEntryPlus> = Vec::with_capacity(children.len() - start);
+        for child in &children[start..] {
+            let child_path = path.join(&child.name);
+            let mut attr = match self.fs.stat(&child_path).await {
+                Ok(a) => a,
+                Err(_) => {
+                    // A child disappearing between list_dir and stat is
+                    // possible if something else mutates the dir while
+                    // we're walking it. Skip silently — it'll surface
+                    // on the next readdir.
+                    continue;
+                }
+            };
+            // Replace the OS-reported ino with our internal ino so the
+            // sprite's caches line up with future Lookup results.
+            let child_ino = {
+                let mut inodes = self.inodes.lock().await;
+                inodes.intern(&child_path)
+            };
+            attr.ino = child_ino;
+            entries.push(DirEntryPlus {
+                name: child.name.clone(),
+                kind: child.kind,
+                attr,
+            });
+        }
+        Response::DirPagePlus {
             entries,
             next_offset: None,
         }
