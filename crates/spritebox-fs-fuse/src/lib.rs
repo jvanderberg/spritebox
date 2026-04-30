@@ -32,7 +32,7 @@ use fuser::{
 use spritebox_fs_protocol::{
     FileAttr as PAttr, FileKind, Ino, OpenFlags, ROOT_INO, errno as e,
 };
-use spritebox_fs_remote::{ClientError, RemoteFs};
+use spritebox_fs_remote::{ClientError, ClientResult, RemoteFs};
 use tokio::runtime::Handle;
 
 /// FUSE-side default TTLs for kernel-level caching. The real cache TTLs
@@ -102,27 +102,43 @@ fn open_flags_from(flags: i32) -> OpenFlags {
 }
 
 /// Each callback funnels through this macro: open a tracing span, time
-/// the call, run the async `RemoteFs` op, map errors, reply.
+/// the call, run the async `RemoteFs` op on the runtime as a spawned
+/// task (so the FUSE thread returns immediately and the next callback
+/// can dispatch in parallel), map errors, reply.
 ///
-/// Usage: `fuse_call!(self, span_name, ino_or_path, async_block, on_ok)`
+/// Reply* types are Send (ReplySender: Send + Sync + 'static), so they
+/// can cross the spawn boundary. The macro takes a closure that
+/// returns the future from a moved `Arc<dyn RemoteFs>` clone, so the
+/// future is `'static` (no borrows from the FUSE thread's stack).
+///
+/// Usage:
+///   fuse_call!(self, "fuse.read", { ino, offset, size }, |remote| async move {
+///       remote.read(ino as Ino, fh, offset as u64, size).await
+///   }, reply, |reply, bytes| reply.data(&bytes));
 macro_rules! fuse_call {
-    ($self:expr, $span:expr, { $($field:tt)* }, $fut:expr, $reply:expr, $ok:expr) => {{
+    ($self:expr, $span:expr, { $($field:tt)* }, $make_fut:expr, $reply:expr, $ok:expr) => {{
         let span = tracing::info_span!($span, $($field)*);
-        let _enter = span.enter();
-        let t0 = std::time::Instant::now();
-        let result = $self.runtime.block_on($fut);
-        let elapsed_ms = t0.elapsed().as_millis() as u64;
-        match result {
-            Ok(value) => {
-                tracing::info!(elapsed_ms, "ok");
-                $ok($reply, value);
+        let reply = $reply;
+        let on_ok = $ok;
+        let remote = $self.remote.clone();
+        let fut = ($make_fut)(remote);
+        $self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let t0 = std::time::Instant::now();
+            let result = fut.await;
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            match result {
+                Ok(value) => {
+                    tracing::info!(elapsed_ms, "ok");
+                    on_ok(reply, value);
+                }
+                Err(err) => {
+                    let errno = errno_for(&err);
+                    tracing::warn!(elapsed_ms, errno, "err");
+                    reply.error(errno);
+                }
             }
-            Err(err) => {
-                let errno = errno_for(&err);
-                tracing::warn!(elapsed_ms, errno, "err");
-                $reply.error(errno);
-            }
-        }
+        });
     }};
 }
 
@@ -137,43 +153,47 @@ impl Filesystem for SpriteboxFs {
         };
         let remote = self.remote.clone();
         let span = tracing::info_span!("fuse.lookup", parent, name = %name_str);
-        let _enter = span.enter();
-        let t0 = std::time::Instant::now();
-        let result = self.runtime.block_on(remote.lookup(parent as Ino, &name_str));
-        let elapsed_ms = t0.elapsed().as_millis() as u64;
-        match result {
-            Ok(attr) => {
-                tracing::info!(elapsed_ms, ino = attr.ino, "ok");
-                reply.entry(&ENTRY_TTL, &to_fuse_attr(&attr), GENERATION);
+        self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let t0 = std::time::Instant::now();
+            let result = remote.lookup(parent as Ino, &name_str).await;
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            match result {
+                Ok(attr) => {
+                    tracing::info!(elapsed_ms, ino = attr.ino, "ok");
+                    reply.entry(&ENTRY_TTL, &to_fuse_attr(&attr), GENERATION);
+                }
+                Err(err) => {
+                    let errno = errno_for(&err);
+                    tracing::warn!(elapsed_ms, errno, "err");
+                    reply.error(errno);
+                }
             }
-            Err(err) => {
-                let errno = errno_for(&err);
-                tracing::warn!(elapsed_ms, errno, "err");
-                reply.error(errno);
-            }
-        }
+        });
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let remote = self.remote.clone();
         fuse_call!(
             self,
             "fuse.getattr",
             { ino },
-            remote.getattr(ino as Ino),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.getattr(ino as Ino).await
+            },
             reply,
             |reply: ReplyAttr, attr: PAttr| reply.attr(&ATTR_TTL, &to_fuse_attr(&attr))
         );
     }
 
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        let remote = self.remote.clone();
         let of = open_flags_from(flags);
         fuse_call!(
             self,
             "fuse.open",
             { ino },
-            remote.open(ino as Ino, of),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.open(ino as Ino, of).await
+            },
             reply,
             |reply: ReplyOpen, handle: u64| reply.opened(handle, 0)
         );
@@ -189,12 +209,13 @@ impl Filesystem for SpriteboxFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let remote = self.remote.clone();
         fuse_call!(
             self,
             "fuse.release",
             { ino, fh },
-            remote.release(ino as Ino, fh),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.release(ino as Ino, fh).await
+            },
             reply,
             |reply: ReplyEmpty, _: ()| reply.ok()
         );
@@ -211,12 +232,13 @@ impl Filesystem for SpriteboxFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let remote = self.remote.clone();
         fuse_call!(
             self,
             "fuse.read",
             { ino, fh, offset, size },
-            remote.read(ino as Ino, fh, offset as u64, size),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.read(ino as Ino, fh, offset as u64, size).await
+            },
             reply,
             |reply: ReplyData, bytes: bytes::Bytes| reply.data(&bytes)
         );
@@ -238,23 +260,23 @@ impl Filesystem for SpriteboxFs {
         let data = data.to_vec();
         let len = data.len();
         let span = tracing::info_span!("fuse.write", ino, fh, offset, len);
-        let _enter = span.enter();
-        let t0 = std::time::Instant::now();
-        let result = self
-            .runtime
-            .block_on(remote.write(ino as Ino, fh, offset as u64, &data));
-        let elapsed_ms = t0.elapsed().as_millis() as u64;
-        match result {
-            Ok(written) => {
-                tracing::info!(elapsed_ms, written, "ok");
-                reply.written(written);
+        self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let t0 = std::time::Instant::now();
+            let result = remote.write(ino as Ino, fh, offset as u64, &data).await;
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            match result {
+                Ok(written) => {
+                    tracing::info!(elapsed_ms, written, "ok");
+                    reply.written(written);
+                }
+                Err(err) => {
+                    let errno = errno_for(&err);
+                    tracing::warn!(elapsed_ms, errno, "err");
+                    reply.error(errno);
+                }
             }
-            Err(err) => {
-                let errno = errno_for(&err);
-                tracing::warn!(elapsed_ms, errno, "err");
-                reply.error(errno);
-            }
-        }
+        });
     }
 
     fn readdir(
@@ -267,30 +289,30 @@ impl Filesystem for SpriteboxFs {
     ) {
         let remote = self.remote.clone();
         let span = tracing::info_span!("fuse.readdir", ino, offset);
-        let _enter = span.enter();
-        let result = self
-            .runtime
-            .block_on(remote.readdir(ino as Ino, offset as u64));
-        match result {
-            Ok(page) => {
-                let mut idx = offset as u64;
-                for entry in page.entries {
-                    idx += 1;
-                    let kind = match entry.kind {
-                        FileKind::Regular => FileType::RegularFile,
-                        FileKind::Directory => FileType::Directory,
-                        FileKind::Symlink => FileType::Symlink,
-                    };
-                    if reply.add(entry.ino, idx as i64, kind, &entry.name) {
-                        break;
+        self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let result = remote.readdir(ino as Ino, offset as u64).await;
+            match result {
+                Ok(page) => {
+                    let mut idx = offset as u64;
+                    for entry in page.entries {
+                        idx += 1;
+                        let kind = match entry.kind {
+                            FileKind::Regular => FileType::RegularFile,
+                            FileKind::Directory => FileType::Directory,
+                            FileKind::Symlink => FileType::Symlink,
+                        };
+                        if reply.add(entry.ino, idx as i64, kind, &entry.name) {
+                            break;
+                        }
                     }
+                    reply.ok();
                 }
-                reply.ok();
+                Err(err) => {
+                    reply.error(errno_for(&err));
+                }
             }
-            Err(err) => {
-                reply.error(errno_for(&err));
-            }
-        }
+        });
     }
 
     fn create(
@@ -313,29 +335,32 @@ impl Filesystem for SpriteboxFs {
         };
         let of = open_flags_from(flags);
         let span = tracing::info_span!("fuse.create", parent, name = %name_str);
-        let _enter = span.enter();
-        let result = self.runtime.block_on(async {
-            let attr = remote
-                .create(parent as Ino, &name_str, (mode & 0o7777) as u16, of)
-                .await?;
-            let handle = remote.open(attr.ino, of).await?;
-            Ok::<(_, u64), ClientError>((attr, handle))
+        self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let result: Result<(_, u64), ClientError> = async {
+                let attr = remote
+                    .create(parent as Ino, &name_str, (mode & 0o7777) as u16, of)
+                    .await?;
+                let handle = remote.open(attr.ino, of).await?;
+                Ok((attr, handle))
+            }
+            .await;
+            match result {
+                Ok((attr, handle)) => {
+                    tracing::info!(ino = attr.ino, handle, "ok");
+                    reply.created(
+                        &ENTRY_TTL,
+                        &to_fuse_attr(&attr),
+                        GENERATION,
+                        handle,
+                        0,
+                    );
+                }
+                Err(err) => {
+                    reply.error(errno_for(&err));
+                }
+            }
         });
-        match result {
-            Ok((attr, handle)) => {
-                tracing::info!(ino = attr.ino, handle, "ok");
-                reply.created(
-                    &ENTRY_TTL,
-                    &to_fuse_attr(&attr),
-                    GENERATION,
-                    handle,
-                    0,
-                );
-            }
-            Err(err) => {
-                reply.error(errno_for(&err));
-            }
-        }
     }
 
     fn mkdir(
@@ -347,7 +372,6 @@ impl Filesystem for SpriteboxFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let remote = self.remote.clone();
         let name_str = match name.to_str() {
             Some(s) => s.to_string(),
             None => {
@@ -355,18 +379,20 @@ impl Filesystem for SpriteboxFs {
                 return;
             }
         };
+        let mode = (mode & 0o7777) as u16;
         fuse_call!(
             self,
             "fuse.mkdir",
             { parent, name = name_str.as_str() },
-            remote.mkdir(parent as Ino, &name_str, (mode & 0o7777) as u16),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.mkdir(parent as Ino, &name_str, mode).await
+            },
             reply,
             |reply: ReplyEntry, attr: PAttr| reply.entry(&ENTRY_TTL, &to_fuse_attr(&attr), GENERATION)
         );
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let remote = self.remote.clone();
         let name_str = match name.to_str() {
             Some(s) => s.to_string(),
             None => {
@@ -378,14 +404,15 @@ impl Filesystem for SpriteboxFs {
             self,
             "fuse.unlink",
             { parent, name = name_str.as_str() },
-            remote.unlink(parent as Ino, &name_str),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.unlink(parent as Ino, &name_str).await
+            },
             reply,
             |reply: ReplyEmpty, _: ()| reply.ok()
         );
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let remote = self.remote.clone();
         let name_str = match name.to_str() {
             Some(s) => s.to_string(),
             None => {
@@ -397,7 +424,9 @@ impl Filesystem for SpriteboxFs {
             self,
             "fuse.rmdir",
             { parent, name = name_str.as_str() },
-            remote.rmdir(parent as Ino, &name_str),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.rmdir(parent as Ino, &name_str).await
+            },
             reply,
             |reply: ReplyEmpty, _: ()| reply.ok()
         );
@@ -413,7 +442,6 @@ impl Filesystem for SpriteboxFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let remote = self.remote.clone();
         let from = match name.to_str() {
             Some(s) => s.to_string(),
             None => {
@@ -432,7 +460,11 @@ impl Filesystem for SpriteboxFs {
             self,
             "fuse.rename",
             { parent, newparent, from = from.as_str(), to = to.as_str() },
-            remote.rename(parent as Ino, &from, newparent as Ino, &to),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote
+                    .rename(parent as Ino, &from, newparent as Ino, &to)
+                    .await
+            },
             reply,
             |reply: ReplyEmpty, _: ()| reply.ok()
         );
@@ -458,20 +490,23 @@ impl Filesystem for SpriteboxFs {
     ) {
         let remote = self.remote.clone();
         let span = tracing::info_span!("fuse.setattr", ino, mode = ?mode, size = ?size);
-        let _enter = span.enter();
-        let result = self.runtime.block_on(async {
-            if let Some(s) = size {
-                remote.truncate(ino as Ino, s).await?;
+        self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let result: ClientResult<_> = async {
+                if let Some(s) = size {
+                    remote.truncate(ino as Ino, s).await?;
+                }
+                if let Some(m) = mode {
+                    remote.chmod(ino as Ino, (m & 0o7777) as u16).await?;
+                }
+                remote.getattr(ino as Ino).await
             }
-            if let Some(m) = mode {
-                remote.chmod(ino as Ino, (m & 0o7777) as u16).await?;
+            .await;
+            match result {
+                Ok(attr) => reply.attr(&ATTR_TTL, &to_fuse_attr(&attr)),
+                Err(err) => reply.error(errno_for(&err)),
             }
-            remote.getattr(ino as Ino).await
         });
-        match result {
-            Ok(attr) => reply.attr(&ATTR_TTL, &to_fuse_attr(&attr)),
-            Err(err) => reply.error(errno_for(&err)),
-        }
     }
 
     fn fsync(
@@ -482,12 +517,13 @@ impl Filesystem for SpriteboxFs {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let remote = self.remote.clone();
         fuse_call!(
             self,
             "fuse.fsync",
             { ino, fh, datasync },
-            remote.fsync(ino as Ino, fh, datasync),
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.fsync(ino as Ino, fh, datasync).await
+            },
             reply,
             |reply: ReplyEmpty, _: ()| reply.ok()
         );
@@ -496,20 +532,22 @@ impl Filesystem for SpriteboxFs {
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         let remote = self.remote.clone();
         let span = tracing::info_span!("fuse.statfs");
-        let _enter = span.enter();
-        let result = self.runtime.block_on(remote.statfs(ROOT_INO));
-        match result {
-            Ok(st) => reply.statfs(
-                st.blocks,
-                st.bfree,
-                st.bavail,
-                st.files,
-                st.ffree,
-                st.bsize,
-                st.namelen,
-                st.bsize,
-            ),
-            Err(err) => reply.error(errno_for(&err)),
-        }
+        self.runtime.spawn(async move {
+            let _enter = span.enter();
+            let result = remote.statfs(ROOT_INO).await;
+            match result {
+                Ok(st) => reply.statfs(
+                    st.blocks,
+                    st.bfree,
+                    st.bavail,
+                    st.files,
+                    st.ffree,
+                    st.bsize,
+                    st.namelen,
+                    st.bsize,
+                ),
+                Err(err) => reply.error(errno_for(&err)),
+            }
+        });
     }
 }

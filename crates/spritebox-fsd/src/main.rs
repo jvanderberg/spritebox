@@ -68,14 +68,15 @@ fn main() -> Result<(), String> {
         let cached = CachedRemote::new(client, CacheConfig::default());
         cached.spawn_invalidator(push_rx);
 
-        run_fuse(&args.mount, cached, runtime_handle()).await
+        let remote: Arc<dyn spritebox_fs_remote::RemoteFs> = cached;
+        run_fuse(&args.mount, remote, runtime_handle()).await
     })
 }
 
 #[cfg(target_os = "linux")]
 async fn run_fuse(
     mount: &std::path::Path,
-    remote: Arc<CachedRemote<spritebox_fs_transport::StdioSink<tokio::io::Stdout>>>,
+    remote: Arc<dyn spritebox_fs_remote::RemoteFs>,
     runtime: tokio::runtime::Handle,
 ) -> Result<(), String> {
     use spritebox_fs_fuse::SpriteboxFs;
@@ -103,7 +104,7 @@ async fn run_fuse(
 #[cfg(not(target_os = "linux"))]
 async fn run_fuse(
     _mount: &std::path::Path,
-    _remote: Arc<CachedRemote<spritebox_fs_transport::StdioSink<tokio::io::Stdout>>>,
+    _remote: Arc<dyn spritebox_fs_remote::RemoteFs>,
     _runtime: tokio::runtime::Handle,
 ) -> Result<(), String> {
     Err("spritebox-fsd only runs on Linux (FUSE)".into())
