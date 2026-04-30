@@ -148,18 +148,27 @@ impl Filesystem for SpriteboxFs {
         _req: &Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
-        // Opt in to readdirplus. fuser 0.15's defaults DON'T include
-        // FUSE_DO_READDIRPLUS, which means the kernel issues
-        // readdir + N × LOOKUP for `ls -la` even though we implement
-        // the readdirplus callback. Without these capabilities a
-        // 100-file dir is 100+ WAN round-trips per `ls`.
-        //
-        // FUSE_DO_READDIRPLUS: tell the kernel readdirplus is supported
+        // FUSE_DO_READDIRPLUS: enable the readdirplus opcode (one
+        //   round-trip for `ls -la` instead of N+1).
         // FUSE_READDIRPLUS_AUTO: let the kernel pick readdirplus vs
-        //   readdir based on the access pattern (saves the
-        //   per-entry-attr cost when stats aren't actually needed)
+        //   readdir based on the access pattern.
+        // FUSE_WRITEBACK_CACHE: kernel buffers writes in its page
+        //   cache, batches them down to us, and crucially keeps mmap
+        //   coherent with our content. Without this flag every FUSE
+        //   write blocks the kernel until our daemon ACKs the host
+        //   write — that's one WAN RTT per kernel write, which made
+        //   cargo build unusably slow.
+        //
+        //   We tried implementing user-space write-back ourselves and
+        //   immediately broke rustc with SIGBUS during link — rustc
+        //   mmaps input .rlib files, and our user-space buffer made
+        //   the kernel's view of file size briefly disagree with the
+        //   host's, so a page fault landed in undefined territory.
+        //   FUSE_WRITEBACK_CACHE delegates write-back to the Linux
+        //   page cache itself, which is mmap-coherent by construction.
         let want = fuser::consts::FUSE_DO_READDIRPLUS
-            | fuser::consts::FUSE_READDIRPLUS_AUTO;
+            | fuser::consts::FUSE_READDIRPLUS_AUTO
+            | fuser::consts::FUSE_WRITEBACK_CACHE;
         if let Err(unsupported) = config.add_capabilities(want) {
             tracing::warn!(
                 unsupported,
