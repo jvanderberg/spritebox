@@ -1,9 +1,10 @@
 //! Stdio-framed transport adapter.
 //!
 //! Wraps any [`AsyncRead`] + [`AsyncWrite`] pair as a [`FrameSink`] /
-//! [`FrameStream`]. Framing is `[u32 length][Frame as JSON]` — JSON
-//! because it's easy to debug; the protocol can switch to a denser
-//! encoding later without touching layout.
+//! [`FrameStream`]. Framing is `[u32 length][Frame as postcard]`.
+//! Postcard's varint encoding leaves binary `Bytes` payloads on the
+//! wire as raw bytes (5-byte length prefix + payload), eliminating
+//! the ~3× tax JSON imposed on `Read` responses.
 //!
 //! This is the production transport on the sprite side: the daemon
 //! reads frames from stdin and writes to stdout. Carried byte-for-byte
@@ -40,7 +41,7 @@ impl<W: AsyncWrite + Send + Unpin + 'static> FrameSink for StdioSink<W> {
             return Err(TransportError::Closed);
         }
         let body =
-            serde_json::to_vec(&frame).map_err(|_| TransportError::Closed)?;
+            postcard::to_allocvec(&frame).map_err(|_| TransportError::Closed)?;
         if body.len() as u64 > MAX_FRAME_BYTES as u64 {
             return Err(TransportError::Closed);
         }
@@ -82,7 +83,7 @@ impl<R: AsyncRead + Send + Unpin + 'static> FrameStream for StdioStream<R> {
         if self.inner.read_exact(&mut body).await.is_err() {
             return None;
         }
-        serde_json::from_slice(&body).ok()
+        postcard::from_bytes(&body).ok()
     }
 }
 

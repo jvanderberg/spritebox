@@ -309,8 +309,8 @@ mod tests {
     #[test]
     fn file_attr_round_trip_via_bincode_compatible_serde() {
         let a = sample_attr();
-        let json = serde_json::to_string(&a).unwrap();
-        let b: FileAttr = serde_json::from_str(&json).unwrap();
+        let bytes = postcard::to_allocvec(&a).unwrap();
+        let b: FileAttr = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(a, b);
     }
 
@@ -325,8 +325,8 @@ mod tests {
                 size: 8192,
             },
         };
-        let json = serde_json::to_string(&frame).unwrap();
-        let back: Frame = serde_json::from_str(&json).unwrap();
+        let bytes = postcard::to_allocvec(&frame).unwrap();
+        let back: Frame = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(frame, back);
     }
 
@@ -337,8 +337,8 @@ mod tests {
             id: 7,
             body: Response::bytes(payload.clone()),
         };
-        let json = serde_json::to_string(&frame).unwrap();
-        let back: Frame = serde_json::from_str(&json).unwrap();
+        let bytes = postcard::to_allocvec(&frame).unwrap();
+        let back: Frame = postcard::from_bytes(&bytes).unwrap();
         match back {
             Frame::Response {
                 body: Response::Bytes { data, hash },
@@ -367,8 +367,8 @@ mod tests {
             offset: 0,
             len: 0,
         };
-        let json = serde_json::to_string(&Frame::Push(p.clone())).unwrap();
-        let Frame::Push(back) = serde_json::from_str::<Frame>(&json).unwrap() else {
+        let bytes = postcard::to_allocvec(&Frame::Push(p.clone())).unwrap();
+        let Frame::Push(back) = postcard::from_bytes::<Frame>(&bytes).unwrap() else {
             panic!("not a push");
         };
         assert_eq!(p, back);

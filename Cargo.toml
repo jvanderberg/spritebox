@@ -21,6 +21,7 @@ spritebox-fs-host = { path = "crates/spritebox-fs-host" }
 spritebox-fs-remote = { path = "crates/spritebox-fs-remote" }
 spritebox-fs-fuse = { path = "crates/spritebox-fs-fuse" }
 tracing = "0.1"
+postcard = { version = "1", features = ["alloc"] }
 
 [package]
 name = "spritebox"

@@ -10,7 +10,7 @@
 //! - sprite → host (exit):   `0x03 + code` (we ignore for ongoing ops)
 //!
 //! Inside the stdio body the sprite-side daemon and host both use the
-//! same length-prefixed JSON framing as `crate::stdio` — so reading
+//! same length-prefixed postcard framing as `crate::stdio` — so reading
 //! from the WS strips the 0x01 prefix to recover the same byte stream
 //! the daemon's stdin/stdout sees.
 
@@ -35,8 +35,8 @@ const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
 /// `FrameSink` over the host side of a Sprites exec WebSocket.
 ///
-/// Every Frame is serialized as JSON, length-prefixed, then wrapped in a
-/// `0x00`-prefixed binary WS message (stdin to the daemon).
+/// Every Frame is serialized via postcard, length-prefixed, then wrapped
+/// in a `0x00`-prefixed binary WS message (stdin to the daemon).
 pub struct WsFrameSink<S> {
     sink: SplitSink<TwsStream<S>, Message>,
 }
@@ -57,7 +57,7 @@ where
 {
     async fn send(&mut self, frame: Frame) -> Result<(), TransportError> {
         let body =
-            serde_json::to_vec(&frame).map_err(|_| TransportError::Closed)?;
+            postcard::to_allocvec(&frame).map_err(|_| TransportError::Closed)?;
         if body.len() as u64 > MAX_FRAME_BYTES as u64 {
             return Err(TransportError::Closed);
         }
@@ -93,7 +93,7 @@ where
 /// `FrameStream` over the host side of a Sprites exec WebSocket.
 ///
 /// Reads `0x01`-prefixed binary WS messages, accumulates the body bytes,
-/// and parses out length-prefixed JSON Frames as they become available.
+/// and parses out length-prefixed postcard Frames as they become available.
 ///
 /// Optionally forwards `0x02`-prefixed stderr to a caller-supplied
 /// channel so daemon error messages don't get silently dropped.
@@ -200,7 +200,7 @@ where
                 self.buffer.pop_front();
             }
             let body: Vec<u8> = self.buffer.drain(..len).collect();
-            return serde_json::from_slice(&body).ok();
+            return postcard::from_bytes(&body).ok();
         }
     }
 }
@@ -257,11 +257,11 @@ mod tests {
         sink.send(frame.clone()).await.unwrap();
 
         let body = next_stdin(&mut server_ws).await;
-        assert_eq!(body.len(), 4 + serde_json::to_vec(&frame).unwrap().len());
+        assert_eq!(body.len(), 4 + postcard::to_allocvec(&frame).unwrap().len());
         // Verify length prefix matches the JSON body length.
         let len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
         assert_eq!(len, body.len() - 4);
-        let parsed: Frame = serde_json::from_slice(&body[4..]).unwrap();
+        let parsed: Frame = postcard::from_bytes(&body[4..]).unwrap();
         assert_eq!(parsed, frame);
     }
 
@@ -273,7 +273,7 @@ mod tests {
 
         // Client writes a 0x01-prefixed message containing length-prefixed JSON.
         let frame = Frame::Push(Push::InvalidateAttr { ino: 7 });
-        let body = serde_json::to_vec(&frame).unwrap();
+        let body = postcard::to_allocvec(&frame).unwrap();
         let len = (body.len() as u32).to_be_bytes();
         let mut payload = Vec::with_capacity(1 + 4 + body.len());
         payload.push(STDOUT_PREFIX);
@@ -298,7 +298,7 @@ mod tests {
             id: 9,
             body: Response::bytes(Bytes::from_static(&[0u8, 1, 2, 3, 4, 5, 6, 7])),
         };
-        let body = serde_json::to_vec(&frame).unwrap();
+        let body = postcard::to_allocvec(&frame).unwrap();
         let len = (body.len() as u32).to_be_bytes();
 
         // Split the wire bytes into two messages mid-body to exercise
@@ -348,7 +348,7 @@ mod tests {
             .unwrap();
         // Now a real stdout frame.
         let frame = Frame::Push(Push::Resync { epoch: 1 });
-        let body = serde_json::to_vec(&frame).unwrap();
+        let body = postcard::to_allocvec(&frame).unwrap();
         let len = (body.len() as u32).to_be_bytes();
         let mut payload = Vec::with_capacity(1 + 4 + body.len());
         payload.push(STDOUT_PREFIX);
