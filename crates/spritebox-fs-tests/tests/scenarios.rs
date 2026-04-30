@@ -70,38 +70,57 @@ async fn s01_editor_atomic_save() {
 
 // 2. Disconnect mid-flush — release returns EIO OR data fully durable;
 //    never silent partial loss. Tested as: disconnect mid-write.
+//
+// Reviewer flagged the original version for "lying" — it accepted both
+// outcomes without ever exercising both. This version parameterizes the
+// disconnect threshold across a range covering both the "request hadn't
+// gone out yet" branch (Disconnected) and the "request fully landed but
+// response dropped" branch (Disconnected) and the "everything went
+// through" branch (Ok + host has data).
 #[tokio::test]
-async fn s02_disconnect_during_write() {
-    let h = Harness::new().await;
-    let attr = h
-        .remote
-        .create(ROOT_INO, "big", 0o644, rw_flags())
-        .await
-        .unwrap();
-    let fh = h.remote.open(attr.ino, rw_flags()).await.unwrap();
-    h.remote.write(attr.ino, fh, 0, b"first-chunk").await.unwrap();
+async fn s02_disconnect_during_write_at_various_points() {
+    let mut saw_disconnected = false;
+    let mut saw_ok_with_data = false;
 
-    // Trigger disconnect after a small number of additional bytes.
-    h.c2s_controls.disconnect_after_bytes(50).await;
+    for threshold in [10u64, 50, 100, 250, 500, 5_000_000] {
+        let h = Harness::new().await;
+        let attr = h
+            .remote
+            .create(ROOT_INO, "big", 0o644, rw_flags())
+            .await
+            .unwrap();
+        let fh = h.remote.open(attr.ino, rw_flags()).await.unwrap();
+        h.remote
+            .write(attr.ino, fh, 0, b"first-chunk")
+            .await
+            .unwrap();
 
-    // Subsequent write must either fully succeed (durable on host) or
-    // fail with Disconnected — never silently drop.
-    let result = h.remote.write(attr.ino, fh, 100, b"x".repeat(200).as_slice()).await;
-    match result {
-        Ok(_) => {
-            // It went through — host must have it.
-            let bytes = h
-                .host_fs
-                .read(Path::new("big"), 100, 200)
-                .await
-                .unwrap();
-            assert_eq!(bytes.len(), 200);
+        h.c2s_controls.disconnect_after_bytes(threshold).await;
+
+        let payload = vec![0xAB; 200];
+        let result = h.remote.write(attr.ino, fh, 100, &payload).await;
+        match result {
+            Ok(_) => {
+                let bytes = h.host_fs.read(Path::new("big"), 100, 200).await.unwrap();
+                assert_eq!(bytes.len(), 200);
+                assert_eq!(&bytes[..], &payload[..]);
+                saw_ok_with_data = true;
+            }
+            Err(ClientError::Disconnected) => {
+                saw_disconnected = true;
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
         }
-        Err(ClientError::Disconnected) => {
-            // OK — caller sees an explicit error rather than silent loss.
-        }
-        Err(other) => panic!("unexpected error: {other:?}"),
     }
+
+    assert!(
+        saw_disconnected,
+        "no threshold triggered Disconnected — disconnect injection ineffective"
+    );
+    assert!(
+        saw_ok_with_data,
+        "no threshold left the write intact — Ok branch never exercised"
+    );
 }
 
 // 3. Host watcher race vs in-flight write — sprite mid-write while host-side
@@ -200,11 +219,10 @@ async fn s05_readdir_concurrent_mutation() {
     mutator.await.unwrap();
 }
 
-// 9. Daemon restart mid-flush — kill the host loop, restart it against the
-//    same MemFs, verify the sprite-side caller eventually sees a clean error
-//    or success but never silent loss.
+// 9a. Host loop crash mid-request — pending request surfaces as
+//     Disconnected within a bounded time, never hangs forever.
 #[tokio::test]
-async fn s09_host_loop_restart_during_request() {
+async fn s09a_host_crash_surfaces_as_disconnected() {
     let h = Harness::new().await;
     let attr = h
         .remote
@@ -213,13 +231,9 @@ async fn s09_host_loop_restart_during_request() {
         .unwrap();
     let fh = h.remote.open(attr.ino, rw_flags()).await.unwrap();
 
-    // Kill the host loop mid-conversation.
     h.host_loop.abort();
-
-    // Wait for the abort to take effect.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Pending request must surface as Disconnected, not hang.
     let r = tokio::time::timeout(
         Duration::from_secs(2),
         h.remote.write(attr.ino, fh, 0, b"orphan"),
@@ -227,6 +241,30 @@ async fn s09_host_loop_restart_during_request() {
     .await;
     let inner = r.expect("request hung after host loop crash");
     assert_eq!(inner.unwrap_err(), ClientError::Disconnected);
+}
+
+// 9b. Recovery after harness rebuild — establish a new harness against
+//     the same logical workload pattern; verify the sprite client
+//     functions cleanly after a fresh wire-up. (We can't literally
+//     reattach the old transport pair to a new dispatcher because
+//     InMemoryTransport doesn't expose channel re-binding; verifying
+//     "a new harness works" is the meaningful invariant.)
+#[tokio::test]
+async fn s09b_fresh_harness_after_crash_works() {
+    let h1 = Harness::new().await;
+    h1.host_loop.abort();
+    drop(h1);
+
+    let h2 = Harness::new().await;
+    let attr = h2
+        .remote
+        .create(ROOT_INO, "after", 0o644, rw_flags())
+        .await
+        .unwrap();
+    let fh = h2.remote.open(attr.ino, rw_flags()).await.unwrap();
+    h2.remote.write(attr.ino, fh, 0, b"works").await.unwrap();
+    let bytes = h2.host_fs.read(Path::new("after"), 0, 16).await.unwrap();
+    assert_eq!(&bytes[..], b"works");
 }
 
 // 11. Path-scoping adversarial — `..`, NUL, oversize names, absolute paths.
@@ -305,32 +343,53 @@ async fn s15_fsync_barrier_reaches_host() {
     assert_eq!(&bytes[..], b"durable");
 }
 
-// 16. Concurrent multi-handle reads vs writes — both handles see consistent
-//     state (POSIX-ish: reader sees old or new bytes, never a torn mix).
+// 16. Concurrent multi-handle reads vs writes — both handles see
+//     consistent state under truly concurrent access (POSIX-ish:
+//     reader sees old or new bytes, never a torn mix).
 #[tokio::test]
-async fn s16_concurrent_handles() {
+async fn s16_concurrent_handles_no_torn_reads() {
     let h = Harness::new().await;
     let attr = h
         .remote
         .create(ROOT_INO, "c", 0o644, rw_flags())
         .await
         .unwrap();
-    h.remote
-        .write(
-            attr.ino,
-            h.remote.open(attr.ino, rw_flags()).await.unwrap(),
-            0,
-            b"AAAA",
-        )
-        .await
-        .unwrap();
+    let setup = h.remote.open(attr.ino, rw_flags()).await.unwrap();
+    h.remote.write(attr.ino, setup, 0, b"AAAA").await.unwrap();
+    h.remote.release(attr.ino, setup).await.unwrap();
 
-    let h1 = h.remote.open(attr.ino, rw_flags()).await.unwrap();
-    let h2 = h.remote.open(attr.ino, rw_flags()).await.unwrap();
+    // Run many rounds to exercise the race window. Each round: one task
+    // overwrites the file, another reads. The read MUST observe either
+    // the pre-write state or the post-write state, not a torn mix.
+    for round in 0..200 {
+        // Reset to known state.
+        let s = h.remote.open(attr.ino, rw_flags()).await.unwrap();
+        h.remote.write(attr.ino, s, 0, b"AAAA").await.unwrap();
+        h.remote.release(attr.ino, s).await.unwrap();
 
-    h.remote.write(attr.ino, h1, 0, b"BBBB").await.unwrap();
-    let read_back = h.remote.read(attr.ino, h2, 0, 4).await.unwrap();
-    assert!(&read_back[..] == b"AAAA" || &read_back[..] == b"BBBB");
+        let h1 = h.remote.open(attr.ino, rw_flags()).await.unwrap();
+        let h2 = h.remote.open(attr.ino, rw_flags()).await.unwrap();
+
+        let remote_for_write = &h.remote;
+        let remote_for_read = &h.remote;
+        let writer = async move {
+            remote_for_write
+                .write(attr.ino, h1, 0, b"BBBB")
+                .await
+                .unwrap();
+        };
+        let reader =
+            async move { remote_for_read.read(attr.ino, h2, 0, 4).await.unwrap() };
+
+        let (_, read_back) = tokio::join!(writer, reader);
+        assert!(
+            &read_back[..] == b"AAAA" || &read_back[..] == b"BBBB",
+            "torn read on round {round}: {:?}",
+            &read_back[..]
+        );
+        h.remote.release(attr.ino, h1).await.unwrap();
+        h.remote.release(attr.ino, h2).await.unwrap();
+    }
 }
 
 // 19a. ENOENT on lookup — does propagate cleanly.
