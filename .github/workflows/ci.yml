@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: build daemon
+        run: cargo build --release -p spritebox-fsd --target x86_64-unknown-linux-gnu
+      - name: cargo test
+        run: cargo test --workspace
+      - name: cargo build (full release path with embedded daemon)
+        run: cargo build --release

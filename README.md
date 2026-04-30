@@ -47,9 +47,19 @@ Interactive sessions use WebSocket connections to the Sprites API — no SSH nee
 
 ### Install
 
+**Easiest — prebuilt binary:** download from the [releases page](https://github.com/jvanderberg/spritebox/releases) and put it on your `$PATH`. Each release ships single-binary builds for macOS (Intel + Apple Silicon), Linux x86_64, and Windows x86_64. The `spritebox-fsd` daemon for the FUSE share feature is embedded in the binary — no separate install.
+
+**From source:** if you're building locally and want the `--share` feature, you need to build the cross-compiled Linux daemon first because the sprite runs Linux:
+
 ```bash
+# Linux host: native build, just needs `rustup target add x86_64-unknown-linux-gnu` once
+# macOS host: builds inside a Docker container (Docker Desktop or OrbStack required)
+./scripts/build-daemon.sh
+
 cargo install --path .
 ```
+
+Without the daemon build step, spritebox compiles and runs but `--share` will refuse with a helpful error. CI does the daemon build automatically.
 
 ### Authenticate
 

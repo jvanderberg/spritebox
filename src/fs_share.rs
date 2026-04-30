@@ -22,7 +22,7 @@
 //!     cargo build --release -p spritebox-fsd --target x86_64-unknown-linux-gnu
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -78,33 +78,33 @@ fn log_path_for(remote_mount: &str) -> String {
     format!("/tmp/spritebox-fsd-{}.log", slug.trim_matches('_'))
 }
 
-/// Default search paths for a pre-built `spritebox-fsd` binary.
-fn locate_daemon_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        if !p.exists() {
-            return Err(format!(
-                "daemon binary not found at: {}",
-                p.display()
-            ));
-        }
-        return Ok(p.to_path_buf());
+/// The cross-compiled Linux daemon binary is embedded into the CLI at
+/// build time by `build.rs`. If the build couldn't find a daemon binary,
+/// `daemon_embedded` cfg is unset and `daemon_bytes()` returns None.
+#[cfg(daemon_embedded)]
+const DAEMON_BYTES: &[u8] = include_bytes!(env!("SPRITEBOX_FSD_PATH"));
+
+#[cfg(not(daemon_embedded))]
+const DAEMON_BYTES: &[u8] = &[];
+
+fn daemon_bytes() -> Result<&'static [u8], String> {
+    if DAEMON_BYTES.is_empty() {
+        Err(
+            "this spritebox build does not include an embedded \
+             spritebox-fsd daemon binary.\n\
+             \n\
+             To enable --share, build the daemon and rebuild spritebox:\n\
+             \t./scripts/build-daemon.sh\n\
+             \tcargo build\n\
+             \n\
+             Or use a release build of spritebox from \
+             https://github.com/jvanderberg/spritebox/releases — \
+             those ship with the daemon embedded."
+                .into(),
+        )
+    } else {
+        Ok(DAEMON_BYTES)
     }
-    let candidates = [
-        "target/x86_64-unknown-linux-gnu/release/spritebox-fsd",
-        "target/x86_64-unknown-linux-gnu/debug/spritebox-fsd",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    Err(format!(
-        "spritebox-fsd binary not found. Build it via:\n\
-         \tdocker run --rm -v \"$(pwd)\":/work -w /work rust:1 \\\n\
-         \t    cargo build --release -p spritebox-fsd --target x86_64-unknown-linux-gnu\n\
-         \tor pass --daemon <path>"
-    ))
 }
 
 /// Provision the sprite for FS sharing: chmod /dev/fuse, enable
@@ -113,7 +113,7 @@ fn locate_daemon_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
 async fn provision(
     client: &SpritesClient,
     sprite_name: &str,
-    daemon_path: &Path,
+    daemon_bytes: &[u8],
     remote_mount: &str,
 ) -> Result<(), String> {
     eprintln!("ensuring /dev/fuse is openable...");
@@ -148,9 +148,7 @@ async fn provision(
         ));
     }
 
-    eprintln!("installing spritebox-fsd...");
-    let bytes = std::fs::read(daemon_path)
-        .map_err(|e| format!("read daemon binary: {e}"))?;
+    eprintln!("installing spritebox-fsd ({} bytes)...", daemon_bytes.len());
     let r = client
         .exec_with_stdin(
             sprite_name,
@@ -161,7 +159,7 @@ async fn provision(
             ],
             &[],
             None,
-            &bytes,
+            daemon_bytes,
         )
         .await?;
     if r.exit_code != 0 {
@@ -203,12 +201,9 @@ pub async fn prepare(
     client: SpritesClient,
     sprite_name: &str,
     spec: ShareSpec,
-    daemon_override: Option<&Path>,
 ) -> Result<Share, String> {
-    let daemon = locate_daemon_binary(daemon_override)?;
-    eprintln!("daemon: {}", daemon.display());
-
-    provision(&client, sprite_name, &daemon, &spec.remote).await?;
+    let bytes = daemon_bytes()?;
+    provision(&client, sprite_name, bytes, &spec.remote).await?;
 
     eprintln!("opening exec WebSocket...");
     // The daemon needs CAP_SYS_ADMIN to mount FUSE; run under sudo so it

@@ -112,10 +112,6 @@ struct LaunchOptions {
     /// LOCAL:REMOTE. Repeat for multiple shares.
     #[arg(long = "share", value_name = "LOCAL:REMOTE")]
     shares: Vec<String>,
-    /// Override path to the cross-compiled spritebox-fsd binary used by
-    /// --share. Defaults to target/x86_64-unknown-linux-gnu/{release,debug}.
-    #[arg(long = "share-daemon")]
-    share_daemon: Option<std::path::PathBuf>,
     /// Print verbose output.
     #[arg(long)]
     verbose: bool,
@@ -554,7 +550,7 @@ fi
     let share_handles = if options.shares.is_empty() {
         Vec::new()
     } else {
-        spawn_shares(&client, &sprite_name, &options.shares, options.share_daemon.as_deref()).await?
+        spawn_shares(&client, &sprite_name, &options.shares).await?
     };
 
     let result = if options.dispatch {
@@ -609,7 +605,6 @@ async fn spawn_shares(
     client: &SpritesClient,
     sprite_name: &str,
     specs: &[String],
-    daemon_override: Option<&std::path::Path>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, String> {
     let mut handles = Vec::with_capacity(specs.len());
     for raw in specs {
@@ -625,7 +620,6 @@ async fn spawn_shares(
             client.clone(),
             sprite_name,
             spec,
-            daemon_override,
         )
         .await?;
         // Now spawn the dispatch loop into the background.
