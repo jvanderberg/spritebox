@@ -192,6 +192,7 @@ pub trait RemoteFs: Send + Sync + 'static {
         new_name: &str,
     ) -> ClientResult<()>;
     async fn truncate(&self, ino: Ino, size: u64) -> ClientResult<()>;
+    async fn chmod(&self, ino: Ino, mode: u16) -> ClientResult<()>;
     async fn fsync(&self, ino: Ino, handle: u64, data_only: bool) -> ClientResult<()>;
     async fn statfs(&self, ino: Ino) -> ClientResult<StatFs>;
 }
@@ -393,6 +394,10 @@ impl<S: FrameSink> RemoteFs for PassthroughRemote<S> {
 
     async fn truncate(&self, ino: Ino, size: u64) -> ClientResult<()> {
         unwrap_ok(self.req(Request::Truncate { ino, size }).await?)
+    }
+
+    async fn chmod(&self, ino: Ino, mode: u16) -> ClientResult<()> {
+        unwrap_ok(self.req(Request::Chmod { ino, mode }).await?)
     }
 
     async fn fsync(&self, ino: Ino, handle: u64, data_only: bool) -> ClientResult<()> {

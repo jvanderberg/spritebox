@@ -12,9 +12,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use spritebox_fs_protocol::{
-    DirEntry, FileAttr, FileKind, Frame, Push, Request, RequestId, Response, StatFs,
+    DirEntry, FileAttr, FileKind, Frame, Ino, OpenFlags, Push, Request, RequestId, Response,
+    StatFs,
     errno::{self as e},
 };
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 use crate::{HostFs, InodeTable};
@@ -22,23 +24,35 @@ use crate::{HostFs, InodeTable};
 /// Push pipe shared with the watcher / external invalidator.
 pub type PushSender = tokio::sync::mpsc::Sender<Push>;
 
+/// Per-open-handle state. Tracks the inode and flags so the dispatcher
+/// can honor `O_APPEND` semantics on write and validate read/write
+/// permission against the open mode.
+#[derive(Debug, Clone, Copy)]
+struct HandleState {
+    ino: Ino,
+    flags: OpenFlags,
+}
+
 #[derive(Default)]
 struct OpenHandles {
     next_handle: u64,
-    in_flight: u32,
+    open: HashMap<u64, HandleState>,
 }
 
 impl OpenHandles {
-    fn alloc(&mut self) -> u64 {
+    fn alloc(&mut self, ino: Ino, flags: OpenFlags) -> u64 {
         self.next_handle += 1;
-        self.in_flight += 1;
-        self.next_handle
+        let h = self.next_handle;
+        self.open.insert(h, HandleState { ino, flags });
+        h
     }
 
-    fn release(&mut self) {
-        if self.in_flight > 0 {
-            self.in_flight -= 1;
-        }
+    fn release(&mut self, handle: u64) {
+        self.open.remove(&handle);
+    }
+
+    fn get(&self, handle: u64) -> Option<HandleState> {
+        self.open.get(&handle).copied()
     }
 }
 
@@ -86,14 +100,20 @@ impl<F: HostFs> Dispatcher<F> {
             Request::Lookup { parent, name } => self.lookup(parent, &name).await,
             Request::GetAttr { ino } => self.getattr(ino).await,
             Request::ReadDir { ino, offset } => self.readdir(ino, offset).await,
-            Request::Open { ino, .. } => self.open(ino).await,
-            Request::Release { .. } => self.release().await,
+            Request::Open { ino, flags } => self.open(ino, flags).await,
+            Request::Release { handle, .. } => self.release(handle).await,
             Request::Read {
-                ino, offset, size, ..
-            } => self.read(ino, offset, size).await,
+                ino,
+                handle,
+                offset,
+                size,
+            } => self.read(ino, handle, offset, size).await,
             Request::Write {
-                ino, offset, data, ..
-            } => self.write(ino, offset, &data).await,
+                ino,
+                handle,
+                offset,
+                data,
+            } => self.write(ino, handle, offset, &data).await,
             Request::Create {
                 parent,
                 name,
@@ -117,6 +137,7 @@ impl<F: HostFs> Dispatcher<F> {
                     .await
             }
             Request::Truncate { ino, size } => self.truncate(ino, size).await,
+            Request::Chmod { ino, mode } => self.chmod(ino, mode).await,
             Request::Fsync { ino, .. } => self.fsync(ino).await,
             Request::StatFs { .. } => Response::StatFs(default_statfs()),
         }
@@ -195,29 +216,46 @@ impl<F: HostFs> Dispatcher<F> {
         }
     }
 
-    async fn open(&self, ino: spritebox_fs_protocol::Ino) -> Response {
+    async fn open(&self, ino: Ino, flags: OpenFlags) -> Response {
         let path = match self.resolve_ino(ino).await {
             Ok(p) => p,
             Err(r) => return r,
         };
         match self.fs.stat(&path).await {
             Ok(_) => {
+                // Honor O_TRUNC at open time so existing content disappears
+                // immediately, matching POSIX semantics. Skip if the open
+                // is read-only (POSIX would EINVAL but we silently accept).
+                if flags.truncate && flags.write
+                    && let Err(err) = self.fs.truncate(&path, 0).await
+                {
+                    return Response::Error { errno: err.errno() };
+                }
                 let mut h = self.handles.lock().await;
                 Response::OpenOk {
-                    handle: h.alloc(),
+                    handle: h.alloc(ino, flags),
                 }
             }
             Err(err) => Response::Error { errno: err.errno() },
         }
     }
 
-    async fn release(&self) -> Response {
+    async fn release(&self, handle: u64) -> Response {
         let mut h = self.handles.lock().await;
-        h.release();
+        h.release(handle);
         Response::Ok
     }
 
-    async fn read(&self, ino: spritebox_fs_protocol::Ino, offset: u64, size: u32) -> Response {
+    async fn read(&self, ino: Ino, handle: u64, offset: u64, size: u32) -> Response {
+        // Validate the handle was opened for reading; reject EBADF if not.
+        if handle != 0 {
+            let h = self.handles.lock().await;
+            if let Some(state) = h.get(handle)
+                && !state.flags.read
+            {
+                return Response::Error { errno: e::EBADF };
+            }
+        }
         let path = match self.resolve_ino(ino).await {
             Ok(p) => p,
             Err(r) => return r,
@@ -230,15 +268,40 @@ impl<F: HostFs> Dispatcher<F> {
 
     async fn write(
         &self,
-        ino: spritebox_fs_protocol::Ino,
+        ino: Ino,
+        handle: u64,
         offset: u64,
         data: &[u8],
     ) -> Response {
+        // Look up the handle's flags. handle == 0 is a sentinel from
+        // callers that aren't tracking handles (e.g. tests); allow.
+        let mut effective_offset = offset;
+        if handle != 0 {
+            let h = self.handles.lock().await;
+            if let Some(state) = h.get(handle) {
+                if !state.flags.write {
+                    return Response::Error { errno: e::EBADF };
+                }
+                if state.flags.append {
+                    let path = match self.resolve_ino(ino).await {
+                        Ok(p) => p,
+                        Err(r) => return r,
+                    };
+                    drop(h);
+                    // Stat fresh so the append always lands at end-of-file
+                    // even if the file grew via another handle.
+                    match self.fs.stat(&path).await {
+                        Ok(attr) => effective_offset = attr.size,
+                        Err(err) => return Response::Error { errno: err.errno() },
+                    }
+                }
+            }
+        }
         let path = match self.resolve_ino(ino).await {
             Ok(p) => p,
             Err(r) => return r,
         };
-        match self.fs.write(&path, offset, data).await {
+        match self.fs.write(&path, effective_offset, data).await {
             Ok(_total) => Response::Written {
                 bytes: data.len() as u32,
             },
@@ -353,6 +416,17 @@ impl<F: HostFs> Dispatcher<F> {
             Err(r) => return r,
         };
         match self.fs.truncate(&path, size).await {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::Error { errno: err.errno() },
+        }
+    }
+
+    async fn chmod(&self, ino: spritebox_fs_protocol::Ino, mode: u16) -> Response {
+        let path = match self.resolve_ino(ino).await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        match self.fs.chmod(&path, mode).await {
             Ok(()) => Response::Ok,
             Err(err) => Response::Error { errno: err.errno() },
         }
@@ -689,5 +763,227 @@ mod tests {
             panic!()
         };
         assert_eq!(a2.size, 10);
+    }
+
+    #[tokio::test]
+    async fn append_handle_writes_at_eof() {
+        let d = dispatcher();
+        let Response::Entry { attr } = handle(
+            &d,
+            Request::Create {
+                parent: ROOT_INO,
+                name: "a".into(),
+                mode: 0o644,
+                flags: open_flags(),
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        // Pre-fill the file via a regular handle.
+        let Response::OpenOk { handle: rw } = handle(
+            &d,
+            Request::Open {
+                ino: attr.ino,
+                flags: open_flags(),
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        handle(
+            &d,
+            Request::Write {
+                ino: attr.ino,
+                handle: rw,
+                offset: 0,
+                data: Bytes::from_static(b"hello"),
+            },
+        )
+        .await;
+        handle(&d, Request::Release { ino: attr.ino, handle: rw }).await;
+
+        // Open with O_APPEND; the offset we pass is irrelevant — the
+        // dispatcher must redirect to EOF.
+        let append_flags = OpenFlags {
+            read: false,
+            write: true,
+            append: true,
+            truncate: false,
+        };
+        let Response::OpenOk { handle: ah } = handle(
+            &d,
+            Request::Open {
+                ino: attr.ino,
+                flags: append_flags,
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        handle(
+            &d,
+            Request::Write {
+                ino: attr.ino,
+                handle: ah,
+                offset: 0, // would normally clobber, but APPEND redirects
+                data: Bytes::from_static(b"-world"),
+            },
+        )
+        .await;
+        let Response::Bytes { data, .. } = handle(
+            &d,
+            Request::Read {
+                ino: attr.ino,
+                handle: 0,
+                offset: 0,
+                size: 64,
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        assert_eq!(&data[..], b"hello-world");
+    }
+
+    #[tokio::test]
+    async fn truncate_flag_clears_on_open() {
+        let d = dispatcher();
+        let Response::Entry { attr } = handle(
+            &d,
+            Request::Create {
+                parent: ROOT_INO,
+                name: "t".into(),
+                mode: 0o644,
+                flags: open_flags(),
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        let h = match handle(
+            &d,
+            Request::Open {
+                ino: attr.ino,
+                flags: open_flags(),
+            },
+        )
+        .await
+        {
+            Response::OpenOk { handle } => handle,
+            other => panic!("{other:?}"),
+        };
+        handle(
+            &d,
+            Request::Write {
+                ino: attr.ino,
+                handle: h,
+                offset: 0,
+                data: Bytes::from_static(b"will be cleared"),
+            },
+        )
+        .await;
+        handle(&d, Request::Release { ino: attr.ino, handle: h }).await;
+
+        // Re-open with O_TRUNC (read|write|truncate). Size must drop to 0.
+        let trunc_flags = OpenFlags {
+            read: true,
+            write: true,
+            append: false,
+            truncate: true,
+        };
+        handle(
+            &d,
+            Request::Open {
+                ino: attr.ino,
+                flags: trunc_flags,
+            },
+        )
+        .await;
+        let Response::Attr(a) = handle(&d, Request::GetAttr { ino: attr.ino }).await else {
+            panic!()
+        };
+        assert_eq!(a.size, 0);
+    }
+
+    #[tokio::test]
+    async fn read_on_writeonly_handle_returns_ebadf() {
+        let d = dispatcher();
+        let Response::Entry { attr } = handle(
+            &d,
+            Request::Create {
+                parent: ROOT_INO,
+                name: "w".into(),
+                mode: 0o644,
+                flags: open_flags(),
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        let writeonly = OpenFlags {
+            read: false,
+            write: true,
+            append: false,
+            truncate: false,
+        };
+        let Response::OpenOk { handle: h } = handle(
+            &d,
+            Request::Open {
+                ino: attr.ino,
+                flags: writeonly,
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        let r = handle(
+            &d,
+            Request::Read {
+                ino: attr.ino,
+                handle: h,
+                offset: 0,
+                size: 16,
+            },
+        )
+        .await;
+        assert_eq!(r, Response::Error { errno: e::EBADF });
+    }
+
+    #[tokio::test]
+    async fn chmod_changes_mode_bits() {
+        let d = dispatcher();
+        let Response::Entry { attr } = handle(
+            &d,
+            Request::Create {
+                parent: ROOT_INO,
+                name: "x".into(),
+                mode: 0o644,
+                flags: open_flags(),
+            },
+        )
+        .await
+        else {
+            panic!()
+        };
+        handle(
+            &d,
+            Request::Chmod {
+                ino: attr.ino,
+                mode: 0o755,
+            },
+        )
+        .await;
+        let Response::Attr(a) = handle(&d, Request::GetAttr { ino: attr.ino }).await else {
+            panic!()
+        };
+        assert_eq!(a.mode, 0o755);
     }
 }

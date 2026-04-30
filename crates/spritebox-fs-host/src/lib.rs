@@ -86,6 +86,7 @@ pub trait HostFs: Send + Sync + 'static {
     async fn rmdir(&self, path: &Path) -> Result<()>;
     async fn rename(&self, from: &Path, to: &Path) -> Result<()>;
     async fn truncate(&self, path: &Path, size: u64) -> Result<()>;
+    async fn chmod(&self, path: &Path, mode: u16) -> Result<()>;
     async fn fsync(&self, path: &Path) -> Result<()>;
     async fn list_dir(&self, path: &Path) -> Result<Vec<DirChild>>;
     /// Snapshot the entire tree as `(path, kind, content)` triples.

@@ -502,6 +502,21 @@ impl HostFs for MemFs {
         Ok(())
     }
 
+    async fn chmod(&self, path: &Path, new_mode: u16) -> Result<()> {
+        check_relative(path)?;
+        let mut inner = self.inner.lock().await;
+        let ino = inner.resolve(path)?;
+        let now = self.clock.now_ns();
+        let entry = inner.inodes.get_mut(&ino).ok_or(HostError::NotFound)?;
+        match &mut entry.node {
+            Node::File { mode, .. } | Node::Dir { mode, .. } => {
+                *mode = new_mode & 0o7777;
+            }
+        }
+        entry.ctime_ns = now;
+        Ok(())
+    }
+
     async fn fsync(&self, path: &Path) -> Result<()> {
         check_relative(path)?;
         let inner = self.inner.lock().await;

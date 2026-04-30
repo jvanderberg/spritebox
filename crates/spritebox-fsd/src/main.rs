@@ -50,7 +50,7 @@ fn main() -> Result<(), String> {
         .with_writer(std::io::stderr)
         .init();
 
-    eprintln!("[fsd-stderr] starting; mount={} verbose={}", args.mount.display(), args.verbose);
+    tracing::info!(mount = %args.mount.display(), verbose = args.verbose, "starting daemon");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

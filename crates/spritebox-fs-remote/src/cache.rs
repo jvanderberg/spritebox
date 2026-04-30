@@ -457,6 +457,14 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         result
     }
 
+    async fn chmod(&self, ino: Ino, mode: u16) -> ClientResult<()> {
+        let result = self.inner.chmod(ino, mode).await;
+        if result.is_ok() {
+            self.state.lock().await.attrs.remove(&ino);
+        }
+        result
+    }
+
     async fn fsync(&self, ino: Ino, handle: u64, data_only: bool) -> ClientResult<()> {
         self.inner.fsync(ino, handle, data_only).await
     }

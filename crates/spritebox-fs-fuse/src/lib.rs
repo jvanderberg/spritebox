@@ -135,7 +135,6 @@ impl Filesystem for SpriteboxFs {
                 return;
             }
         };
-        eprintln!("[fsd-stderr] fuse.lookup parent={parent} name={name_str}");
         let remote = self.remote.clone();
         let span = tracing::info_span!("fuse.lookup", parent, name = %name_str);
         let _enter = span.enter();
@@ -144,13 +143,11 @@ impl Filesystem for SpriteboxFs {
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         match result {
             Ok(attr) => {
-                eprintln!("[fsd-stderr] fuse.lookup ok ino={} elapsed={}ms", attr.ino, elapsed_ms);
                 tracing::info!(elapsed_ms, ino = attr.ino, "ok");
                 reply.entry(&ENTRY_TTL, &to_fuse_attr(&attr), GENERATION);
             }
             Err(err) => {
                 let errno = errno_for(&err);
-                eprintln!("[fsd-stderr] fuse.lookup err errno={errno} elapsed={elapsed_ms}ms");
                 tracing::warn!(elapsed_ms, errno, "err");
                 reply.error(errno);
             }
@@ -158,7 +155,6 @@ impl Filesystem for SpriteboxFs {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        eprintln!("[fsd-stderr] fuse.getattr ino={ino}");
         let remote = self.remote.clone();
         fuse_call!(
             self,
@@ -269,7 +265,6 @@ impl Filesystem for SpriteboxFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        eprintln!("[fsd-stderr] fuse.readdir ino={ino} offset={offset}");
         let remote = self.remote.clone();
         let span = tracing::info_span!("fuse.readdir", ino, offset);
         let _enter = span.enter();
@@ -447,7 +442,7 @@ impl Filesystem for SpriteboxFs {
         &mut self,
         _req: &Request,
         ino: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -462,11 +457,14 @@ impl Filesystem for SpriteboxFs {
         reply: ReplyAttr,
     ) {
         let remote = self.remote.clone();
-        let span = tracing::info_span!("fuse.setattr", ino);
+        let span = tracing::info_span!("fuse.setattr", ino, mode = ?mode, size = ?size);
         let _enter = span.enter();
         let result = self.runtime.block_on(async {
             if let Some(s) = size {
                 remote.truncate(ino as Ino, s).await?;
+            }
+            if let Some(m) = mode {
+                remote.chmod(ino as Ino, (m & 0o7777) as u16).await?;
             }
             remote.getattr(ino as Ino).await
         });

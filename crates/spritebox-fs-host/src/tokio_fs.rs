@@ -154,20 +154,36 @@ impl HostFs for TokioFs {
         Ok(meta.len())
     }
 
-    async fn create(&self, path: &Path, _mode: u16) -> Result<FileAttr> {
+    async fn create(&self, path: &Path, mode: u16) -> Result<FileAttr> {
         let abs = self.resolve(path)?;
-        let _f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&abs)
-            .await
-            .map_err(map_io)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode as u32);
+        }
+        let _f = opts.open(&abs).await.map_err(map_io)?;
+        // Re-apply the mode explicitly: open(2) ANDs with umask, so the
+        // file may have ended up with fewer bits than requested.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(mode as u32);
+            let _ = fs::set_permissions(&abs, perms).await;
+        }
         Self::stat_inner(&abs).await
     }
 
-    async fn mkdir(&self, path: &Path, _mode: u16) -> Result<FileAttr> {
+    async fn mkdir(&self, path: &Path, mode: u16) -> Result<FileAttr> {
         let abs = self.resolve(path)?;
         fs::create_dir(&abs).await.map_err(map_io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(mode as u32);
+            let _ = fs::set_permissions(&abs, perms).await;
+        }
         Self::stat_inner(&abs).await
     }
 
@@ -195,6 +211,21 @@ impl HostFs for TokioFs {
             .await
             .map_err(map_io)?;
         f.set_len(size).await.map_err(map_io)
+    }
+
+    async fn chmod(&self, path: &Path, mode: u16) -> Result<()> {
+        let abs = self.resolve(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(mode as u32);
+            fs::set_permissions(&abs, perms).await.map_err(map_io)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (abs, mode);
+            Ok(())
+        }
     }
 
     async fn fsync(&self, path: &Path) -> Result<()> {

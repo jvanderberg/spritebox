@@ -134,6 +134,10 @@ pub enum Request {
         ino: Ino,
         size: u64,
     },
+    Chmod {
+        ino: Ino,
+        mode: u16,
+    },
     Fsync {
         ino: Ino,
         handle: u64,
