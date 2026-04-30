@@ -205,9 +205,16 @@ pub enum Response {
     /// integrity checking. The receiver MUST verify before serving the
     /// data to a caller; mismatches surface as `EIO` (the transport may
     /// have corrupted the frame).
+    ///
+    /// `generation` is a per-inode monotonic counter; the host bumps it
+    /// on every write/truncate/chmod and on every InvalidateData push
+    /// it sends. The receiving sprite uses it to decide whether a
+    /// just-fetched chunk is safe to insert into the cache (vs. having
+    /// been invalidated mid-flight).
     Bytes {
         data: Bytes,
         hash: Sha256,
+        generation: u64,
     },
     Written {
         bytes: u32,
@@ -221,9 +228,13 @@ pub enum Response {
 
 impl Response {
     /// Build a `Bytes` response and compute the hash from `data`.
-    pub fn bytes(data: Bytes) -> Self {
+    pub fn bytes(data: Bytes, generation: u64) -> Self {
         let hash = Sha256::of(&data);
-        Response::Bytes { data, hash }
+        Response::Bytes {
+            data,
+            hash,
+            generation,
+        }
     }
 }
 
@@ -244,7 +255,15 @@ pub enum Push {
     },
     /// File contents changed in the given byte range; drop matching cache
     /// chunks. `len == 0` means "invalidate everything for this inode."
-    InvalidateData { ino: Ino, offset: u64, len: u64 },
+    /// `generation` is the new generation counter the host has advanced
+    /// to — sprite-side cache fills with strictly less than this gen
+    /// must be discarded.
+    InvalidateData {
+        ino: Ino,
+        offset: u64,
+        len: u64,
+        generation: u64,
+    },
     /// Manifest snapshot epoch — bumped when the host's watcher detects a
     /// change it cannot describe more precisely (e.g. on resync after
     /// reconnect). Sprites should drop their entire metadata cache.
@@ -339,13 +358,13 @@ mod tests {
         let payload = Bytes::from_static(&[0u8, 1, 2, 3, 4, 0xff, 0xfe]);
         let frame = Frame::Response {
             id: 7,
-            body: Response::bytes(payload.clone()),
+            body: Response::bytes(payload.clone(), 42),
         };
         let bytes = postcard::to_allocvec(&frame).unwrap();
         let back: Frame = postcard::from_bytes(&bytes).unwrap();
         match back {
             Frame::Response {
-                body: Response::Bytes { data, hash },
+                body: Response::Bytes { data, hash, .. },
                 ..
             } => {
                 assert_eq!(data, payload);
@@ -370,6 +389,7 @@ mod tests {
             ino: 9,
             offset: 0,
             len: 0,
+            generation: 5,
         };
         let bytes = postcard::to_allocvec(&Frame::Push(p.clone())).unwrap();
         let Frame::Push(back) = postcard::from_bytes::<Frame>(&bytes).unwrap() else {

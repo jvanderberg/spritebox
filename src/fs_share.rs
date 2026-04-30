@@ -259,6 +259,7 @@ impl Share {
         let host_fs = TokioFs::new(spec.local.clone());
         let dispatcher = Dispatcher::new(host_fs);
         let inodes = dispatcher.inodes();
+        let generations = dispatcher.generations();
 
         tokio::spawn(async move {
             // Single writer task owns the sink.
@@ -280,6 +281,7 @@ impl Share {
             let _watcher_guard = watcher::spawn(
                 spec.local.clone(),
                 inodes,
+                generations,
                 push_tx,
                 WatcherConfig::default(),
             )

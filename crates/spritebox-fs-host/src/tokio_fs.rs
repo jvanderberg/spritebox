@@ -158,20 +158,17 @@ impl HostFs for TokioFs {
         let abs = self.resolve(path)?;
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(mode as u32);
-        }
+        // tokio::fs::OpenOptions doesn't expose .mode() directly; the
+        // umask-applied default file is overwritten by an explicit
+        // chmod after open.
         let _f = opts.open(&abs).await.map_err(map_io)?;
-        // Re-apply the mode explicitly: open(2) ANDs with umask, so the
-        // file may have ended up with fewer bits than requested.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(mode as u32);
             let _ = fs::set_permissions(&abs, perms).await;
         }
+        let _ = mode;
         Self::stat_inner(&abs).await
     }
 

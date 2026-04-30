@@ -167,6 +167,15 @@ pub trait RemoteFs: Send + Sync + 'static {
         offset: u64,
         size: u32,
     ) -> ClientResult<Bytes>;
+    /// Read variant that surfaces the host's generation counter, used
+    /// by the cache layer to defend against InvalidateData races.
+    async fn read_with_generation(
+        &self,
+        ino: Ino,
+        handle: u64,
+        offset: u64,
+        size: u32,
+    ) -> ClientResult<(Bytes, u64)>;
     async fn write(
         &self,
         ino: Ino,
@@ -283,6 +292,20 @@ impl<S: FrameSink> RemoteFs for PassthroughRemote<S> {
         offset: u64,
         size: u32,
     ) -> ClientResult<Bytes> {
+        // Default RemoteFs::read drops the generation since most callers
+        // don't need it. CachedRemote uses read_with_generation directly.
+        self.read_with_generation(ino, handle, offset, size)
+            .await
+            .map(|(data, _)| data)
+    }
+
+    async fn read_with_generation(
+        &self,
+        ino: Ino,
+        handle: u64,
+        offset: u64,
+        size: u32,
+    ) -> ClientResult<(Bytes, u64)> {
         match self
             .req(Request::Read {
                 ino,
@@ -292,11 +315,15 @@ impl<S: FrameSink> RemoteFs for PassthroughRemote<S> {
             })
             .await?
         {
-            Response::Bytes { data, hash } => {
+            Response::Bytes {
+                data,
+                hash,
+                generation,
+            } => {
                 if !hash.verify(&data) {
                     return Err(ClientError::Errno(e::EIO));
                 }
-                Ok(data)
+                Ok((data, generation))
             }
             Response::Error { errno } => Err(ClientError::Errno(errno)),
             _ => Err(ClientError::Protocol),

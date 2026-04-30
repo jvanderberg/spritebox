@@ -296,7 +296,7 @@ mod tests {
 
         let frame = Frame::Response {
             id: 9,
-            body: Response::bytes(Bytes::from_static(&[0u8, 1, 2, 3, 4, 5, 6, 7])),
+            body: Response::bytes(Bytes::from_static(&[0u8, 1, 2, 3, 4, 5, 6, 7]), 0),
         };
         let body = postcard::to_allocvec(&frame).unwrap();
         let len = (body.len() as u32).to_be_bytes();

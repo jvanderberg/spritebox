@@ -24,12 +24,12 @@ use crate::{HostFs, InodeTable};
 /// Push pipe shared with the watcher / external invalidator.
 pub type PushSender = tokio::sync::mpsc::Sender<Push>;
 
-/// Per-open-handle state. Tracks the inode and flags so the dispatcher
+/// Per-open-handle state. Tracks the open flags so the dispatcher
 /// can honor `O_APPEND` semantics on write and validate read/write
-/// permission against the open mode.
+/// permission against the open mode. The ino comes in with each
+/// request, so we don't store it here.
 #[derive(Debug, Clone, Copy)]
 struct HandleState {
-    ino: Ino,
     flags: OpenFlags,
 }
 
@@ -40,10 +40,10 @@ struct OpenHandles {
 }
 
 impl OpenHandles {
-    fn alloc(&mut self, ino: Ino, flags: OpenFlags) -> u64 {
+    fn alloc(&mut self, flags: OpenFlags) -> u64 {
         self.next_handle += 1;
         let h = self.next_handle;
-        self.open.insert(h, HandleState { ino, flags });
+        self.open.insert(h, HandleState { flags });
         h
     }
 
@@ -56,10 +56,33 @@ impl OpenHandles {
     }
 }
 
+/// Per-inode monotonic generation counter. Incremented on every write,
+/// truncate, chmod, and on every InvalidateData push the watcher
+/// publishes. Stamped into Response::Bytes so the sprite-side cache can
+/// detect "this fetch raced with an invalidation" and refuse to cache
+/// stale bytes.
+#[derive(Default)]
+pub struct Generations {
+    inner: HashMap<Ino, u64>,
+}
+
+impl Generations {
+    pub fn current(&self, ino: Ino) -> u64 {
+        self.inner.get(&ino).copied().unwrap_or(0)
+    }
+
+    pub fn bump(&mut self, ino: Ino) -> u64 {
+        let entry = self.inner.entry(ino).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+}
+
 pub struct Dispatcher<F: HostFs> {
     fs: Arc<F>,
     inodes: Arc<Mutex<InodeTable>>,
     handles: Arc<Mutex<OpenHandles>>,
+    generations: Arc<Mutex<Generations>>,
 }
 
 impl<F: HostFs> Clone for Dispatcher<F> {
@@ -68,6 +91,7 @@ impl<F: HostFs> Clone for Dispatcher<F> {
             fs: self.fs.clone(),
             inodes: self.inodes.clone(),
             handles: self.handles.clone(),
+            generations: self.generations.clone(),
         }
     }
 }
@@ -78,6 +102,7 @@ impl<F: HostFs> Dispatcher<F> {
             fs: Arc::new(fs),
             inodes: Arc::new(Mutex::new(InodeTable::new())),
             handles: Arc::new(Mutex::new(OpenHandles::default())),
+            generations: Arc::new(Mutex::new(Generations::default())),
         }
     }
 
@@ -87,6 +112,10 @@ impl<F: HostFs> Dispatcher<F> {
 
     pub fn inodes(&self) -> Arc<Mutex<InodeTable>> {
         self.inodes.clone()
+    }
+
+    pub fn generations(&self) -> Arc<Mutex<Generations>> {
+        self.generations.clone()
     }
 
     /// Handle a single request and produce a response.
@@ -233,7 +262,7 @@ impl<F: HostFs> Dispatcher<F> {
                 }
                 let mut h = self.handles.lock().await;
                 Response::OpenOk {
-                    handle: h.alloc(ino, flags),
+                    handle: h.alloc(flags),
                 }
             }
             Err(err) => Response::Error { errno: err.errno() },
@@ -260,8 +289,14 @@ impl<F: HostFs> Dispatcher<F> {
             Ok(p) => p,
             Err(r) => return r,
         };
+        // Snapshot the generation BEFORE the read; stamp it on the
+        // response so the sprite knows "the host's view of this inode
+        // at the moment this read returned." Any later bump bumps a
+        // higher number and InvalidateData carries that new gen, so
+        // the sprite can compare and refuse to cache stale bytes.
+        let generation = self.generations.lock().await.current(ino);
         match self.fs.read(&path, offset, size).await {
-            Ok(b) => Response::bytes(b),
+            Ok(b) => Response::bytes(b, generation),
             Err(err) => Response::Error { errno: err.errno() },
         }
     }
@@ -302,9 +337,12 @@ impl<F: HostFs> Dispatcher<F> {
             Err(r) => return r,
         };
         match self.fs.write(&path, effective_offset, data).await {
-            Ok(_total) => Response::Written {
-                bytes: data.len() as u32,
-            },
+            Ok(_total) => {
+                self.generations.lock().await.bump(ino);
+                Response::Written {
+                    bytes: data.len() as u32,
+                }
+            }
             Err(err) => Response::Error { errno: err.errno() },
         }
     }
@@ -416,7 +454,10 @@ impl<F: HostFs> Dispatcher<F> {
             Err(r) => return r,
         };
         match self.fs.truncate(&path, size).await {
-            Ok(()) => Response::Ok,
+            Ok(()) => {
+                self.generations.lock().await.bump(ino);
+                Response::Ok
+            }
             Err(err) => Response::Error { errno: err.errno() },
         }
     }
@@ -427,7 +468,10 @@ impl<F: HostFs> Dispatcher<F> {
             Err(r) => return r,
         };
         match self.fs.chmod(&path, mode).await {
-            Ok(()) => Response::Ok,
+            Ok(()) => {
+                self.generations.lock().await.bump(ino);
+                Response::Ok
+            }
             Err(err) => Response::Error { errno: err.errno() },
         }
     }
@@ -566,7 +610,7 @@ mod tests {
         };
         assert_eq!(bytes, 5);
 
-        let Response::Bytes { data, hash } = handle(
+        let Response::Bytes { data, hash, .. } = handle(
             &d,
             Request::Read {
                 ino,

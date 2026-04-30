@@ -129,7 +129,7 @@ mod tests {
         let (mut sink, mut stream) = pipe();
         let frame = Frame::Response {
             id: 1,
-            body: Response::bytes(bytes::Bytes::from_static(&[0u8, 1, 2, 3, 4, 0xff])),
+            body: Response::bytes(bytes::Bytes::from_static(&[0u8, 1, 2, 3, 4, 0xff]), 0),
         };
         sink.send(frame.clone()).await.unwrap();
         let back = stream.recv().await.unwrap();

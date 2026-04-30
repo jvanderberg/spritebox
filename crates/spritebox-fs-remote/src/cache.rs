@@ -79,12 +79,18 @@ struct CacheState {
     attrs: HashMap<Ino, AttrEntry>,
     lookups: HashMap<(Ino, String), LookupEntry>,
     content: ContentCache,
+    /// Highest generation we've seen for an inode — bumped on every
+    /// InvalidateData push or local mutation. A read fetch that
+    /// returns a strictly-lower generation has been overtaken by an
+    /// invalidation and must NOT be inserted into the content cache.
+    inode_generation: HashMap<Ino, u64>,
     /// Stats for tests / diagnostics.
     hits_attr: u64,
     misses_attr: u64,
     hits_lookup: u64,
     misses_lookup: u64,
     hits_negative: u64,
+    stale_fetches_dropped: u64,
 }
 
 pub struct CachedRemote<S: FrameSink> {
@@ -99,11 +105,13 @@ impl<S: FrameSink> CachedRemote<S> {
             attrs: HashMap::new(),
             lookups: HashMap::new(),
             content: ContentCache::new(config.content),
+            inode_generation: HashMap::new(),
             hits_attr: 0,
             misses_attr: 0,
             hits_lookup: 0,
             misses_lookup: 0,
             hits_negative: 0,
+            stale_fetches_dropped: 0,
         };
         Arc::new(Self {
             inner: PassthroughRemote::new(client),
@@ -143,6 +151,7 @@ impl<S: FrameSink> CachedRemote<S> {
             hits_content: s.content.hits,
             misses_content: s.content.misses,
             evictions_content: s.content.evictions,
+            stale_fetches_dropped: s.stale_fetches_dropped,
         }
     }
 }
@@ -160,6 +169,7 @@ pub struct CacheStats {
     pub hits_content: u64,
     pub misses_content: u64,
     pub evictions_content: u64,
+    pub stale_fetches_dropped: u64,
 }
 
 fn apply_push(s: &mut CacheState, push: Push) {
@@ -170,9 +180,20 @@ fn apply_push(s: &mut CacheState, push: Push) {
         Push::InvalidateEntry { parent, name, .. } => {
             s.lookups.remove(&(parent, name));
         }
-        Push::InvalidateData { ino, offset, len } => {
+        Push::InvalidateData {
+            ino,
+            offset,
+            len,
+            generation,
+        } => {
             s.attrs.remove(&ino);
             s.content.invalidate_range(ino, offset, len);
+            // Bump the seen generation. Any in-flight fetch with a
+            // strictly-lower generation will be discarded on insert.
+            let entry = s.inode_generation.entry(ino).or_insert(0);
+            if generation > *entry {
+                *entry = generation;
+            }
         }
         Push::Resync { .. } => {
             s.attrs.clear();
@@ -180,6 +201,9 @@ fn apply_push(s: &mut CacheState, push: Push) {
             // Drop all content. ContentCache doesn't have a clear() — just
             // re-init it.
             s.content = ContentCache::new(s.content.config_snapshot());
+            // Resync also invalidates all generations — every cached
+            // inode is suspect.
+            s.inode_generation.clear();
         }
     }
 }
@@ -306,15 +330,51 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
             let chunk_bytes = match chunk_bytes {
                 Some(b) => b,
                 None => {
-                    // Fetch the full chunk from the host.
+                    // Snapshot the seen generation BEFORE fetching. If a
+                    // push arrives during the await advancing the gen,
+                    // we'll see seen_before < returned_gen — actually
+                    // that's the OPPOSITE of what we want. We want: if
+                    // any push arrives while the fetch is in flight,
+                    // refuse to cache. We achieve that by comparing the
+                    // generation we knew about pre-fetch with the gen
+                    // stamped on the response: if `seen_before <`
+                    // response_gen, the host advanced before serving;
+                    // that means our snapshot was stale and the
+                    // response is the new truth — safe to cache (the
+                    // host stamped the new gen). The race we care
+                    // about is when an InvalidateData arrives at the
+                    // sprite *after* the response was emitted but
+                    // *before* we insert. In that case the sprite's
+                    // seen-gen has been bumped to the new gen, which
+                    // is *higher* than the response's stamped gen —
+                    // and we refuse the insert.
+                    let seen_before = {
+                        let s = self.state.lock().await;
+                        s.inode_generation.get(&ino).copied().unwrap_or(0)
+                    };
                     let fetch_offset = chunk_idx * chunk_size;
-                    let fetched = self
+                    let (fetched, response_gen) = self
                         .inner
-                        .read(ino, handle, fetch_offset, chunk_size as u32)
+                        .read_with_generation(ino, handle, fetch_offset, chunk_size as u32)
                         .await?;
                     {
                         let mut s = self.state.lock().await;
-                        s.content.insert(ino, chunk_idx, fetched.clone());
+                        let now_seen = s.inode_generation.get(&ino).copied().unwrap_or(0);
+                        // If a push raised the seen generation past the
+                        // response's stamped generation while we were
+                        // fetching, the response is stale.
+                        if now_seen > response_gen {
+                            s.stale_fetches_dropped += 1;
+                        } else {
+                            s.content.insert(ino, chunk_idx, fetched.clone());
+                            // Track the host's view. seen_before is
+                            // referenced for clarity but only the max
+                            // matters.
+                            let entry =
+                                s.inode_generation.entry(ino).or_insert(0);
+                            let max_gen = response_gen.max(seen_before).max(*entry);
+                            *entry = max_gen;
+                        }
                     }
                     fetched
                 }
@@ -337,6 +397,20 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         Ok(Bytes::from(out))
     }
 
+    async fn read_with_generation(
+        &self,
+        ino: Ino,
+        handle: u64,
+        offset: u64,
+        size: u32,
+    ) -> ClientResult<(Bytes, u64)> {
+        // Pass through; the cache uses this internally and shouldn't
+        // re-cache via this entry point.
+        self.inner
+            .read_with_generation(ino, handle, offset, size)
+            .await
+    }
+
     async fn write(
         &self,
         ino: Ino,
@@ -345,12 +419,14 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         data: &[u8],
     ) -> ClientResult<u32> {
         // Writes invalidate attr cache (size/mtime change) and content
-        // cache for the affected range.
+        // cache for the affected range. Also bumps the seen generation
+        // so any in-flight read fetch from before this write is dropped.
         let result = self.inner.write(ino, handle, offset, data).await;
         if result.is_ok() {
             let mut s = self.state.lock().await;
             s.attrs.remove(&ino);
             s.content.invalidate_range(ino, offset, data.len() as u64);
+            *s.inode_generation.entry(ino).or_insert(0) += 1;
         }
         result
     }
@@ -453,6 +529,7 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
             let mut s = self.state.lock().await;
             s.attrs.remove(&ino);
             s.content.invalidate_ino(ino);
+            *s.inode_generation.entry(ino).or_insert(0) += 1;
         }
         result
     }
@@ -460,7 +537,9 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
     async fn chmod(&self, ino: Ino, mode: u16) -> ClientResult<()> {
         let result = self.inner.chmod(ino, mode).await;
         if result.is_ok() {
-            self.state.lock().await.attrs.remove(&ino);
+            let mut s = self.state.lock().await;
+            s.attrs.remove(&ino);
+            *s.inode_generation.entry(ino).or_insert(0) += 1;
         }
         result
     }
@@ -763,6 +842,7 @@ mod tests {
                 ino: attr.ino,
                 offset: 0,
                 len: 16,
+                generation: 1,
             })
             .await
             .unwrap();
@@ -770,6 +850,62 @@ mod tests {
 
         let bytes = cached.read(attr.ino, fh, 0, 16).await.unwrap();
         assert_eq!(&bytes[..], b"FROM-HOST!!!!!!!");
+    }
+
+    /// Race coverage: an InvalidateData push that arrives BEFORE a read
+    /// fetch's response makes it back must cause the response to be
+    /// dropped (not cached). The way we engineer this in a unit test is
+    /// to bump the cache's seen-generation past the response's stamped
+    /// generation directly via a Push; subsequent reads do NOT cache.
+    #[tokio::test]
+    async fn race_invalidation_before_response_drops_stale_fetch() {
+        // Use a low-latency setup. The harness host doesn't yet stamp a
+        // realistic generation on responses (passthrough returns gen=0
+        // from the host's read path because Generations is empty until
+        // a write bumps it). So we craft the test by writing once
+        // (host-side gen → 1), reading (response stamped gen=1),
+        // then sending a Push with gen=2 and reading again.
+        let cfg = CacheConfig {
+            content: ContentCacheConfig {
+                chunk_size: 16,
+                max_chunks: 8,
+            },
+            ..Default::default()
+        };
+        let (cached, _host_fs, push_tx) = rig(cfg).await;
+        let attr = cached
+            .create(ROOT_INO, "x", 0o644, rw_flags())
+            .await
+            .unwrap();
+        let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
+        cached.write(attr.ino, fh, 0, b"v1-data!!!!!!!!!").await.unwrap();
+        // First read populates the cache.
+        cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        let stats0 = cached.stats().await;
+        assert!(stats0.content_chunks >= 1);
+
+        // Push a future-generation invalidation. This bumps the
+        // sprite-side seen-gen past anything the host can stamp on a
+        // pre-existing response.
+        push_tx
+            .send(Push::InvalidateData {
+                ino: attr.ino,
+                offset: 0,
+                len: 0,
+                generation: 999_999,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Now any read fetches a response stamped with the host's
+        // (lower) generation. The cache should refuse to insert.
+        cached.read(attr.ino, fh, 0, 16).await.unwrap();
+        let stats1 = cached.stats().await;
+        assert!(
+            stats1.stale_fetches_dropped > 0,
+            "expected stale_fetches_dropped > 0, got {stats1:?}"
+        );
     }
 
     /// Cache-transparency: identical sequence of reads against

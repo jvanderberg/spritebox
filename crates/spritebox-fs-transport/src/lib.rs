@@ -373,7 +373,11 @@ fn apply_corruption(policy: &mut Policy, frame: Frame) -> Frame {
         return frame;
     };
     let new_body = match body {
-        Response::Bytes { data, hash } => {
+        Response::Bytes {
+            data,
+            hash,
+            generation,
+        } => {
             // Corrupt the *data* but leave the hash untouched. That's the
             // point: hash-on-receive must catch transit corruption.
             let mut v = data.to_vec();
@@ -385,6 +389,7 @@ fn apply_corruption(policy: &mut Policy, frame: Frame) -> Frame {
             Response::Bytes {
                 data: bytes::Bytes::from(v),
                 hash,
+                generation,
             }
         }
         other => other,
@@ -420,7 +425,7 @@ mod tests {
     fn resp_bytes(id: RequestId, payload: &'static [u8]) -> Frame {
         Frame::Response {
             id,
-            body: Response::bytes(bytes::Bytes::from_static(payload)),
+            body: Response::bytes(bytes::Bytes::from_static(payload), 0),
         }
     }
 
@@ -532,7 +537,7 @@ mod tests {
         match frame {
             Frame::Response {
                 id: 7,
-                body: Response::Bytes { data, hash },
+                body: Response::Bytes { data, hash, .. },
             } => {
                 assert_eq!(data[0], b'h');
                 assert_eq!(data[1], b'e');
@@ -560,7 +565,7 @@ mod tests {
         match frame {
             Frame::Response {
                 id: 7,
-                body: Response::Bytes { data, hash },
+                body: Response::Bytes { data, hash, .. },
             } => {
                 assert_eq!(&data[..], b"hello");
                 assert!(hash.verify(&data));

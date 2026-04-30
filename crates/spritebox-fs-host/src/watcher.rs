@@ -32,6 +32,7 @@ use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, new_debouncer};
 use spritebox_fs_protocol::{Ino, Push, ROOT_INO};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::dispatch::Generations;
 use crate::inode_table::InodeTable;
 
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +83,7 @@ pub struct Watcher {
 pub fn spawn(
     root: PathBuf,
     inodes: Arc<Mutex<InodeTable>>,
+    generations: Arc<Mutex<Generations>>,
     tx: mpsc::Sender<Push>,
     config: WatcherConfig,
 ) -> Result<Watcher, WatcherError> {
@@ -121,16 +123,22 @@ pub fn spawn(
         .map_err(|e| WatcherError::Notify(e.to_string()))?;
 
     let root_clone = root.clone();
+    let resync_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let join = tokio::spawn(async move {
         while let Some(result) = raw_rx.recv().await {
             match result {
                 Ok(events) => {
                     for ev in events {
-                        translate(&root_clone, &inodes, &tx, &ev).await;
+                        translate(&root_clone, &inodes, &generations, &tx, &ev).await;
                     }
                 }
                 Err(_errs) => {
-                    let _ = tx.send(Push::Resync { epoch: 0 }).await;
+                    // Bump epoch on every error storm so the sprite can
+                    // tell repeated resyncs apart.
+                    let epoch = resync_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    let _ = tx.send(Push::Resync { epoch }).await;
                 }
             }
         }
@@ -145,6 +153,7 @@ pub fn spawn(
 async fn translate(
     root: &Path,
     inodes: &Mutex<InodeTable>,
+    generations: &Mutex<Generations>,
     tx: &mpsc::Sender<Push>,
     ev: &DebouncedEvent,
 ) {
@@ -154,15 +163,46 @@ async fn translate(
         EventKind::Create(CreateKind::File | CreateKind::Folder | CreateKind::Other) => {
             collect_entry_invalidations(root, inodes, &ev.event.paths).await
         }
-        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other) => {
+        // Distinguish content changes from metadata-only changes:
+        // - Data → InvalidateData (drops content cache + attr)
+        // - Metadata → InvalidateAttr only (mode/mtime change, content
+        //   is still valid)
+        EventKind::Modify(ModifyKind::Data(_)) => {
             let mut out = Vec::new();
             for path in &ev.event.paths {
                 if let Some(ino) = ino_for_path(root, inodes, path).await {
+                    let new_gen = generations.lock().await.bump(ino);
+                    out.push(Push::InvalidateData {
+                        ino,
+                        offset: 0,
+                        len: 0,
+                        generation: new_gen,
+                    });
+                }
+            }
+            out
+        }
+        EventKind::Modify(ModifyKind::Metadata(_)) => {
+            let mut out = Vec::new();
+            for path in &ev.event.paths {
+                if let Some(ino) = ino_for_path(root, inodes, path).await {
+                    out.push(Push::InvalidateAttr { ino });
+                }
+            }
+            out
+        }
+        EventKind::Modify(ModifyKind::Other) => {
+            // Unspecified modify — over-invalidate to be safe.
+            let mut out = Vec::new();
+            for path in &ev.event.paths {
+                if let Some(ino) = ino_for_path(root, inodes, path).await {
+                    let new_gen = generations.lock().await.bump(ino);
                     out.push(Push::InvalidateAttr { ino });
                     out.push(Push::InvalidateData {
                         ino,
                         offset: 0,
                         len: 0,
+                        generation: new_gen,
                     });
                 }
             }
@@ -180,7 +220,8 @@ async fn translate(
             collect_entry_invalidations(root, inodes, &ev.event.paths).await
         }
         _ => {
-            // Unknown event kind — over-invalidate.
+            // Unknown event kind — over-invalidate. Epoch=0 is fine here;
+            // a hard error path uses fetch_add in the caller.
             vec![Push::Resync { epoch: 0 }]
         }
     };
@@ -282,9 +323,11 @@ mod tests {
         let root = dir.path().to_path_buf();
         let it = Arc::new(Mutex::new(InodeTable::new()));
         let (tx, mut rx) = mpsc::channel(64);
+        let gens = Arc::new(Mutex::new(Generations::default()));
         let _w = spawn(
             root.clone(),
             it.clone(),
+            gens,
             tx,
             WatcherConfig {
                 debounce: Duration::from_millis(50),
@@ -315,9 +358,11 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel(64);
+        let gens = Arc::new(Mutex::new(Generations::default()));
         let _w = spawn(
             root.clone(),
             it.clone(),
+            gens,
             tx,
             WatcherConfig {
                 debounce: Duration::from_millis(50),
@@ -364,9 +409,11 @@ mod tests {
             populate_inode(&mut g, &["doomed"]);
         }
         let (tx, mut rx) = mpsc::channel(64);
+        let gens = Arc::new(Mutex::new(Generations::default()));
         let _w = spawn(
             root.clone(),
             it.clone(),
+            gens,
             tx,
             WatcherConfig {
                 debounce: Duration::from_millis(50),
