@@ -110,6 +110,14 @@ struct LaunchOptions {
     /// them with `claude -p` instead of opening an interactive console.
     #[arg(long, requires_all = ["repo", "branch"])]
     dispatch: bool,
+    /// Mount a local directory at a sprite path via FUSE. Format:
+    /// LOCAL:REMOTE. Repeat for multiple shares.
+    #[arg(long = "share", value_name = "LOCAL:REMOTE")]
+    shares: Vec<String>,
+    /// Override path to the cross-compiled spritebox-fsd binary used by
+    /// --share. Defaults to target/x86_64-unknown-linux-gnu/{release,debug}.
+    #[arg(long = "share-daemon")]
+    share_daemon: Option<std::path::PathBuf>,
     /// Print verbose output.
     #[arg(long)]
     verbose: bool,
@@ -560,8 +568,15 @@ fi
     )
     .await?;
 
-    if options.dispatch {
-        // Dispatch loop: poll message board for leader tasks, run with claude -p
+    // Spin up FUSE shares before the console so the mount points are
+    // populated by the time the user shell starts.
+    let share_handles = if options.shares.is_empty() {
+        Vec::new()
+    } else {
+        spawn_shares(&client, &sprite_name, &options.shares, options.share_daemon.as_deref()).await?
+    };
+
+    let result = if options.dispatch {
         dispatch_loop(&client, &sprite_name, &options, &session_env).await
     } else {
         // Open interactive console
@@ -599,7 +614,48 @@ fi
             return Err(format!("session exited with code {code}"));
         }
         Ok(())
+    };
+
+    // Tear down shares so the daemons exit cleanly.
+    for h in share_handles {
+        h.abort();
     }
+
+    result
+}
+
+async fn spawn_shares(
+    client: &SpritesClient,
+    sprite_name: &str,
+    specs: &[String],
+    daemon_override: Option<&std::path::Path>,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, String> {
+    let mut handles = Vec::with_capacity(specs.len());
+    for raw in specs {
+        let spec = crate::fs_share::ShareSpec::parse(raw)?;
+        eprintln!(
+            "share: {} → {}",
+            spec.local.display(),
+            spec.remote
+        );
+        let client = client.clone();
+        let sprite_name = sprite_name.to_string();
+        let daemon = daemon_override.map(|p| p.to_path_buf());
+        let handle = tokio::spawn(async move {
+            if let Err(e) = crate::fs_share::run(
+                client,
+                &sprite_name,
+                spec,
+                daemon.as_deref(),
+            )
+            .await
+            {
+                eprintln!("share failed: {e}");
+            }
+        });
+        handles.push(handle);
+    }
+    Ok(handles)
 }
 
 /// Dispatch loop: install a dispatch script inside the sprite and run it via
