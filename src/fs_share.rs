@@ -171,16 +171,17 @@ async fn provision(
         ));
     }
 
-    // Self-heal: kill any orphan daemon holding this mount, lazily
-    // unmount the path if it's already a (possibly stale) FUSE mount,
-    // then ensure the directory exists. Errors from kill/umount are
-    // expected on a fresh sprite and ignored; only mkdir failure is
-    // fatal.
+    // Self-heal: lazily unmount the path if it's already a (possibly
+    // stale) FUSE mount, then ensure the directory exists. `umount -l`
+    // detaches the mount from the filesystem hierarchy immediately
+    // even if there are still open file descriptors; the orphan
+    // daemon holding the old mount becomes harmless and exits when
+    // its kernel channel goes away. The umount may fail (path not
+    // mounted on a fresh sprite); we ignore that. Only mkdir failure
+    // is fatal.
     eprintln!("preparing mount point {remote_mount}...");
     let cleanup_cmd = format!(
-        "sudo pkill -9 -f 'spritebox-fsd --mount {mount}' 2>/dev/null; \
-         sudo umount -l {mount} 2>/dev/null; \
-         sudo mkdir -p {mount}",
+        "sudo umount -l {mount} 2>/dev/null; sudo mkdir -p {mount}",
         mount = remote_mount,
     );
     let r = client
