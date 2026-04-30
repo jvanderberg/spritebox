@@ -171,14 +171,20 @@ async fn provision(
         ));
     }
 
-    eprintln!("creating mount point {remote_mount}...");
+    // Self-heal: kill any orphan daemon holding this mount, lazily
+    // unmount the path if it's already a (possibly stale) FUSE mount,
+    // then ensure the directory exists. Errors from kill/umount are
+    // expected on a fresh sprite and ignored; only mkdir failure is
+    // fatal.
+    eprintln!("preparing mount point {remote_mount}...");
+    let cleanup_cmd = format!(
+        "sudo pkill -9 -f 'spritebox-fsd --mount {mount}' 2>/dev/null; \
+         sudo umount -l {mount} 2>/dev/null; \
+         sudo mkdir -p {mount}",
+        mount = remote_mount,
+    );
     let r = client
-        .exec(
-            sprite_name,
-            &["sudo", "mkdir", "-p", remote_mount],
-            &[],
-            None,
-        )
+        .exec(sprite_name, &["sh", "-c", &cleanup_cmd], &[], None)
         .await?;
     if r.exit_code != 0 {
         return Err(format!(
