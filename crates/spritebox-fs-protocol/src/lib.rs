@@ -268,6 +268,24 @@ pub enum Push {
     /// change it cannot describe more precisely (e.g. on resync after
     /// reconnect). Sprites should drop their entire metadata cache.
     Resync { epoch: u64 },
+    /// Background prefetch — host has read a file and is shipping its
+    /// contents preemptively to populate the sprite's content cache
+    /// before any kernel callback asks for it. The sprite inserts at
+    /// `(ino, chunk_idx)` keyed entries; if the ino isn't yet known
+    /// to the sprite (no prior lookup), the chunk still slots into
+    /// the content cache and a subsequent lookup bringing the ino
+    /// into being will find it already populated.
+    ///
+    /// `chunk_idx` is the chunk index (offset / chunk_size). The
+    /// sprite will refuse the prefill if its chunk_size differs from
+    /// the host's assumption — falls back to a fetch on first read.
+    Prefill {
+        ino: Ino,
+        chunk_idx: u64,
+        chunk_size: u32,
+        data: Bytes,
+        generation: u64,
+    },
 }
 
 /// Frame on the wire: either a paired request, a paired response, or an

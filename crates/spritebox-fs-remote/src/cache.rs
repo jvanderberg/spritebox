@@ -209,6 +209,32 @@ fn apply_push(s: &mut CacheState, push: Push) {
             // inode is suspect.
             s.inode_generation.clear();
         }
+        Push::Prefill {
+            ino,
+            chunk_idx,
+            chunk_size,
+            data,
+            generation,
+        } => {
+            // Refuse if the host's chunking assumption differs from
+            // ours — we can't address the chunk correctly. Falls back
+            // to a regular fetch on first read.
+            if chunk_size as usize != s.content.chunk_size() {
+                return;
+            }
+            // Honor the same anti-stale check the regular read path uses.
+            let now_seen =
+                s.inode_generation.get(&ino).copied().unwrap_or(0);
+            if now_seen > generation {
+                s.stale_fetches_dropped += 1;
+                return;
+            }
+            s.content.insert(ino, chunk_idx, data);
+            let entry = s.inode_generation.entry(ino).or_insert(0);
+            if generation > *entry {
+                *entry = generation;
+            }
+        }
     }
 }
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use spritebox_fs_host::watcher::WatcherConfig;
-use spritebox_fs_host::{Dispatcher, TokioFs, watcher};
+use spritebox_fs_host::{Dispatcher, PrefetchConfig, TokioFs, prefetch, watcher};
 use spritebox_fs_protocol::Frame;
 use spritebox_fs_transport::{FrameSink, FrameStream, WsFrameSink, WsFrameStream};
 use tokio::sync::{Mutex, mpsc};
@@ -292,12 +292,25 @@ impl Share {
             let (push_tx, mut push_rx) = mpsc::channel(64);
             let _watcher_guard = watcher::spawn(
                 spec.local.clone(),
-                inodes,
-                generations,
-                push_tx,
+                inodes.clone(),
+                generations.clone(),
+                push_tx.clone(),
                 WatcherConfig::default(),
             )
             .ok();
+
+            // Background prefetch: walk the share root and ship the
+            // contents of small files first, populating the sprite's
+            // content cache before the kernel asks for them.
+            let prefetch_handle = prefetch::spawn(
+                std::path::PathBuf::new(),
+                Arc::new(TokioFs::new(spec.local.clone())),
+                inodes,
+                generations,
+                push_tx,
+                PrefetchConfig::default(),
+            );
+
             let pusher = tokio::spawn({
                 let out_tx = out_tx.clone();
                 async move {
@@ -322,6 +335,7 @@ impl Share {
             }
 
             drop(out_tx);
+            prefetch_handle.abort();
             let _ = writer.await;
             pusher.abort();
             let _ = pusher.await;
