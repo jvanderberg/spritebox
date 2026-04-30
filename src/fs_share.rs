@@ -28,7 +28,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use spritebox_fs_host::watcher::WatcherConfig;
 use spritebox_fs_host::{Dispatcher, PrefetchConfig, TokioFs, prefetch, watcher};
-use spritebox_fs_protocol::Frame;
+use spritebox_fs_protocol::{Frame, Push};
 use spritebox_fs_transport::{FrameSink, FrameStream, WsFrameSink, WsFrameStream};
 use tokio::sync::{Mutex, mpsc};
 
@@ -281,13 +281,38 @@ impl Share {
         let generations = dispatcher.generations();
 
         tokio::spawn(async move {
-            // Single writer task owns the sink.
-            let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
+            // Two queues with strict priority: responses to user
+            // requests must drain before background prefill traffic.
+            // Without this, prefetch's ~80 MiB sweep saturates the
+            // writer FIFO and an interactive `ls` waits 10-20s for
+            // its response to advance through the queue.
+            //
+            // resp_tx: dispatcher responses (priority A — interactive)
+            // push_tx: watcher invalidations + prefetch prefills
+            //          (priority B — background)
+            let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(128);
+            let (push_tx, mut push_rx) = mpsc::channel::<Push>(64);
+
             let frame_sink = Arc::new(Mutex::new(frame_sink));
             let writer = tokio::spawn({
                 let frame_sink = frame_sink.clone();
                 async move {
-                    while let Some(frame) = out_rx.recv().await {
+                    loop {
+                        // `biased` polls in source order; responses
+                        // are checked first every iteration, so a
+                        // burst of pushes can't starve interactive
+                        // traffic.
+                        let frame = tokio::select! {
+                            biased;
+                            r = resp_rx.recv() => match r {
+                                Some(f) => f,
+                                None => break,
+                            },
+                            p = push_rx.recv() => match p {
+                                Some(push) => Frame::Push(push),
+                                None => break,
+                            },
+                        };
                         let mut g = frame_sink.lock().await;
                         if g.send(frame).await.is_err() {
                             break;
@@ -296,7 +321,6 @@ impl Share {
                 }
             });
 
-            let (push_tx, mut push_rx) = mpsc::channel(64);
             let _watcher_guard = watcher::spawn(
                 spec.local.clone(),
                 inodes.clone(),
@@ -318,34 +342,21 @@ impl Share {
                 PrefetchConfig::default(),
             );
 
-            let pusher = tokio::spawn({
-                let out_tx = out_tx.clone();
-                async move {
-                    while let Some(push) = push_rx.recv().await {
-                        if out_tx.send(Frame::Push(push)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-
             let dispatcher = Arc::new(dispatcher);
             while let Some(frame) = frame_stream.recv().await {
                 if let Frame::Request { id, body } = frame {
                     let dispatcher = dispatcher.clone();
-                    let out_tx = out_tx.clone();
+                    let resp_tx = resp_tx.clone();
                     tokio::spawn(async move {
                         let resp = dispatcher.handle(id, body).await;
-                        let _ = out_tx.send(resp).await;
+                        let _ = resp_tx.send(resp).await;
                     });
                 }
             }
 
-            drop(out_tx);
+            drop(resp_tx);
             prefetch_handle.abort();
             let _ = writer.await;
-            pusher.abort();
-            let _ = pusher.await;
         })
     }
 }
