@@ -28,7 +28,6 @@ pub async fn run() -> Result<(), String> {
         Command::List => list_sprites().await,
         Command::Destroy(options) => destroy(options).await,
         Command::Doctor => doctor().await,
-        Command::Share(options) => share_command(options).await,
         Command::Help(text) => {
             print!("{text}");
             Ok(())
@@ -48,7 +47,6 @@ enum Command {
     List,
     Destroy(DestroyOptions),
     Doctor,
-    Share(ShareOptions),
     Help(String),
 }
 
@@ -162,20 +160,6 @@ struct DestroyOptions {
     yes: bool,
 }
 
-#[derive(Clone, Debug, Args)]
-pub struct ShareOptions {
-    /// LOCAL:REMOTE — absolute local directory mounted at REMOTE inside the sprite.
-    pub spec: String,
-    #[command(flatten)]
-    target: TargetOptions,
-    /// Path to a pre-built spritebox-fsd binary. If omitted, looked up under
-    /// target/x86_64-unknown-linux-gnu/{release,debug}/spritebox-fsd.
-    #[arg(long)]
-    pub daemon: Option<std::path::PathBuf>,
-    #[arg(long)]
-    pub verbose: bool,
-}
-
 #[derive(Debug, Parser)]
 #[command(
     name = "spritebox",
@@ -204,8 +188,6 @@ enum ClapCommand {
     Destroy(DestroyOptions),
     /// Check prerequisites.
     Doctor,
-    /// Share a local directory into a sprite via FUSE.
-    Share(ShareOptions),
     Help,
 }
 
@@ -242,7 +224,6 @@ impl Cli {
             Some(ClapCommand::List) => Command::List,
             Some(ClapCommand::Destroy(options)) => Command::Destroy(options),
             Some(ClapCommand::Doctor) => Command::Doctor,
-            Some(ClapCommand::Share(options)) => Command::Share(options),
             Some(ClapCommand::Help) => Command::Help(render_help()),
             None => Command::Launch(cli.launch),
         };
@@ -904,21 +885,6 @@ async fn destroy(options: DestroyOptions) -> Result<(), String> {
     client.delete_sprite(&sprite_name).await?;
     println!("destroyed {sprite_name}");
     Ok(())
-}
-
-async fn share_command(options: ShareOptions) -> Result<(), String> {
-    let spec = crate::fs_share::ShareSpec::parse(&options.spec)?;
-
-    let mut client = create_client()?;
-    client.set_verbose(options.verbose);
-
-    let sprite_name = state::sprite_name(
-        options.target.name.as_deref(),
-        options.target.repo.as_deref(),
-        options.target.branch.as_deref(),
-    )?;
-
-    crate::fs_share::run(client, &sprite_name, spec, options.daemon.as_deref()).await
 }
 
 async fn doctor() -> Result<(), String> {

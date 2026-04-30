@@ -68,6 +68,16 @@ impl ShareSpec {
     }
 }
 
+/// Per-mount daemon log path on the sprite. Slug the mount path so
+/// concurrent shares don't collide.
+fn log_path_for(remote_mount: &str) -> String {
+    let slug: String = remote_mount
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("/tmp/spritebox-fsd-{}.log", slug.trim_matches('_'))
+}
+
 /// Default search paths for a pre-built `spritebox-fsd` binary.
 fn locate_daemon_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = explicit {
@@ -195,20 +205,22 @@ pub async fn prepare(
 
     eprintln!("opening exec WebSocket...");
     // The daemon needs CAP_SYS_ADMIN to mount FUSE; run under sudo so it
-    // executes as root. Stderr is captured to /tmp/spritebox-fsd.log so
-    // it survives even if the WS doesn't relay 0x02 frames in this
-    // session mode.
+    // executes as root. Stderr is captured to a per-mount log file so
+    // multiple concurrent shares don't trample each other and so it
+    // survives the Sprites exec WS not relaying 0x02 stderr frames in
+    // this session mode (verified empirically — even a direct write
+    // to /proc/<pid>/fd/2 doesn't make it through). To inspect:
+    //     spritebox exec --name <sprite> -- sudo cat <log_path>
+    let log_path = log_path_for(&spec.remote);
+    eprintln!("daemon log on sprite: {log_path}");
+    let cmd = format!(
+        "exec sudo -E sh -c 'exec /usr/local/bin/spritebox-fsd \
+         --mount \"$1\" --verbose 2>>\"$2\"' sh \"$0\" \"{log_path}\"",
+    );
     let ws = client
         .open_exec(
             sprite_name,
-            &[
-                "sh",
-                "-c",
-                "exec sudo -E sh -c 'exec /usr/local/bin/spritebox-fsd \
-                 --mount \"$1\" --verbose 2>>/tmp/spritebox-fsd.log' \
-                 sh \"$0\"",
-                &spec.remote,
-            ],
+            &["sh", "-c", &cmd, &spec.remote],
             &[("RUST_LOG", "info")],
             None,
         )
@@ -317,21 +329,6 @@ impl Share {
     }
 }
 
-/// Foreground convenience: prepare and run until the daemon disconnects.
-/// Used by the `spritebox share` standalone subcommand.
-pub async fn run(
-    client: SpritesClient,
-    sprite_name: &str,
-    spec: ShareSpec,
-    daemon_override: Option<&Path>,
-) -> Result<(), String> {
-    let share = prepare(client, sprite_name, spec, daemon_override).await?;
-    eprintln!("share running. ctrl-c to exit.");
-    let handle = share.spawn();
-    let _ = handle.await;
-    eprintln!("daemon disconnected");
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
