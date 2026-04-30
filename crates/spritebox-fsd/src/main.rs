@@ -50,6 +50,11 @@ fn main() -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
+        // Stderr is redirected to a log file via the wrapper sh -c
+        // command in fs_share::prepare; tracing-subscriber's TTY
+        // auto-detection misfires through that pipeline and emits
+        // ANSI escape sequences anyway. Disable explicitly.
+        .with_ansi(false)
         .init();
 
     tracing::info!(mount = %args.mount.display(), verbose = args.verbose, "starting daemon");
