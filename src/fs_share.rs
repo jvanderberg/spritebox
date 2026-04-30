@@ -156,13 +156,15 @@ async fn provision(
     Ok(())
 }
 
-/// Run the share. Blocks until the WebSocket closes or the daemon exits.
-pub async fn run(
+/// Provision the sprite and open the daemon connection. All
+/// user-facing progress messages are printed here, before any terminal
+/// raw-mode console takes over. Returns a ready-to-spawn [`Share`].
+pub async fn prepare(
     client: SpritesClient,
     sprite_name: &str,
     spec: ShareSpec,
     daemon_override: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<Share, String> {
     let daemon = locate_daemon_binary(daemon_override)?;
     eprintln!("daemon: {}", daemon.display());
 
@@ -179,83 +181,105 @@ pub async fn run(
         .await?;
     let (sink, stream) = ws.split();
     let frame_sink = WsFrameSink::new(sink);
-    let mut frame_stream = WsFrameStream::new(stream);
+    let frame_stream = WsFrameStream::new(stream);
 
-    // Host-side dispatcher backed by a TokioFs rooted at the local dir.
-    let host_fs = TokioFs::new(spec.local.clone());
-    let dispatcher = Dispatcher::new(host_fs);
-    let inodes = dispatcher.inodes();
+    Ok(Share {
+        spec,
+        frame_sink,
+        frame_stream,
+    })
+}
 
-    // Single writer task owns the sink — both the dispatcher and the
-    // watcher push outgoing frames into a shared mpsc.
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
-    let frame_sink = Arc::new(Mutex::new(frame_sink));
-    let writer = tokio::spawn({
-        let frame_sink = frame_sink.clone();
-        async move {
-            while let Some(frame) = out_rx.recv().await {
-                let mut g = frame_sink.lock().await;
-                if g.send(frame).await.is_err() {
-                    break;
+/// A prepared share — daemon launched, WebSocket open, ready to drive.
+pub struct Share {
+    pub spec: ShareSpec,
+    frame_sink: WsFrameSink<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    frame_stream:
+        WsFrameStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+}
+
+impl Share {
+    /// Spawn the dispatch loop and watcher. Returns a JoinHandle —
+    /// `abort()` it to tear down. Silent unless something fails.
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        let Share {
+            spec,
+            frame_sink,
+            mut frame_stream,
+        } = self;
+
+        let host_fs = TokioFs::new(spec.local.clone());
+        let dispatcher = Dispatcher::new(host_fs);
+        let inodes = dispatcher.inodes();
+
+        tokio::spawn(async move {
+            // Single writer task owns the sink.
+            let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
+            let frame_sink = Arc::new(Mutex::new(frame_sink));
+            let writer = tokio::spawn({
+                let frame_sink = frame_sink.clone();
+                async move {
+                    while let Some(frame) = out_rx.recv().await {
+                        let mut g = frame_sink.lock().await;
+                        if g.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
                 }
-            }
-        }
-    });
+            });
 
-    // Watcher → Push frames.
-    let (push_tx, mut push_rx) = mpsc::channel(64);
-    let _watcher_guard = match watcher::spawn(
-        spec.local.clone(),
-        inodes,
-        push_tx,
-        WatcherConfig::default(),
-    ) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            eprintln!("warning: failed to start watcher: {e}");
-            None
-        }
-    };
-    let pusher = tokio::spawn({
-        let out_tx = out_tx.clone();
-        async move {
-            while let Some(push) = push_rx.recv().await {
-                if out_tx.send(Frame::Push(push)).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    eprintln!("share running. ctrl-c to exit.");
-
-    // Main dispatch loop: receive requests from the daemon, dispatch,
-    // queue responses on out_tx.
-    let dispatcher = Arc::new(dispatcher);
-    while let Some(frame) = frame_stream.recv().await {
-        match frame {
-            Frame::Request { id, body } => {
-                let dispatcher = dispatcher.clone();
+            let (push_tx, mut push_rx) = mpsc::channel(64);
+            let _watcher_guard = watcher::spawn(
+                spec.local.clone(),
+                inodes,
+                push_tx,
+                WatcherConfig::default(),
+            )
+            .ok();
+            let pusher = tokio::spawn({
                 let out_tx = out_tx.clone();
-                tokio::spawn(async move {
-                    let resp = dispatcher.handle(id, body).await;
-                    let _ = out_tx.send(resp).await;
-                });
-            }
-            Frame::Response { .. } => {
-                // Daemon shouldn't send responses to us; ignore.
-            }
-            Frame::Push(_) => {
-                // Daemon shouldn't push to us; ignore.
-            }
-        }
-    }
+                async move {
+                    while let Some(push) = push_rx.recv().await {
+                        if out_tx.send(Frame::Push(push)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
 
+            let dispatcher = Arc::new(dispatcher);
+            while let Some(frame) = frame_stream.recv().await {
+                if let Frame::Request { id, body } = frame {
+                    let dispatcher = dispatcher.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let resp = dispatcher.handle(id, body).await;
+                        let _ = out_tx.send(resp).await;
+                    });
+                }
+            }
+
+            drop(out_tx);
+            let _ = writer.await;
+            pusher.abort();
+            let _ = pusher.await;
+        })
+    }
+}
+
+/// Foreground convenience: prepare and run until the daemon disconnects.
+/// Used by the `spritebox share` standalone subcommand.
+pub async fn run(
+    client: SpritesClient,
+    sprite_name: &str,
+    spec: ShareSpec,
+    daemon_override: Option<&Path>,
+) -> Result<(), String> {
+    let share = prepare(client, sprite_name, spec, daemon_override).await?;
+    eprintln!("share running. ctrl-c to exit.");
+    let handle = share.spawn();
+    let _ = handle.await;
     eprintln!("daemon disconnected");
-    drop(out_tx); // close writer's channel
-    let _ = writer.await;
-    pusher.abort();
-    let _ = pusher.await;
     Ok(())
 }
 

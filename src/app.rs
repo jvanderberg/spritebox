@@ -638,22 +638,17 @@ async fn spawn_shares(
             spec.local.display(),
             spec.remote
         );
-        let client = client.clone();
-        let sprite_name = sprite_name.to_string();
-        let daemon = daemon_override.map(|p| p.to_path_buf());
-        let handle = tokio::spawn(async move {
-            if let Err(e) = crate::fs_share::run(
-                client,
-                &sprite_name,
-                spec,
-                daemon.as_deref(),
-            )
-            .await
-            {
-                eprintln!("share failed: {e}");
-            }
-        });
-        handles.push(handle);
+        // Provision and open the daemon synchronously so all user-facing
+        // progress messages print before the console enters raw mode.
+        let share = crate::fs_share::prepare(
+            client.clone(),
+            sprite_name,
+            spec,
+            daemon_override,
+        )
+        .await?;
+        // Now spawn the dispatch loop into the background.
+        handles.push(share.spawn());
     }
     Ok(handles)
 }
