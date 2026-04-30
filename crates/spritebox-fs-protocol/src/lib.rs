@@ -171,6 +171,15 @@ pub enum Request {
     StatFs {
         ino: Ino,
     },
+    /// Pack multiple requests into one frame. Host processes them in
+    /// parallel and returns Response::Batch with one entry per
+    /// inner request, in the same order.
+    ///
+    /// Useful when many small ops are known to be issuable
+    /// concurrently (prefetch walks, speculative lookups). The
+    /// CachedRemote can ship them in one round-trip instead of N.
+    /// Inner requests must NOT be Batch — no nesting.
+    Batch(Vec<Request>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +270,9 @@ pub enum Response {
     Error {
         errno: Errno,
     },
+    /// Result for a Request::Batch: one Response per inner request,
+    /// preserving order.
+    Batch(Vec<Response>),
 }
 
 impl Response {

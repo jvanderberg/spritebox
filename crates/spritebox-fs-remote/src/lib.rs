@@ -121,6 +121,33 @@ impl<S: FrameSink> CmdClient<S> {
             Err(_) => Err(ClientError::Disconnected),
         }
     }
+
+    /// Send N requests as one Batch frame. Host processes them in
+    /// parallel and replies with a Batch response in matching order.
+    /// Returns one ClientResult per inner request — individual errors
+    /// surface via the Response::Error variant per slot, while errors
+    /// at the Batch level (Disconnected, Protocol) propagate
+    /// uniformly to all callers.
+    pub async fn request_batch(
+        &self,
+        bodies: Vec<Request>,
+    ) -> ClientResult<Vec<Response>> {
+        if bodies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = bodies.len();
+        let resp = self.request(Request::Batch(bodies)).await?;
+        match resp {
+            Response::Batch(items) => {
+                if items.len() != n {
+                    return Err(ClientError::Protocol);
+                }
+                Ok(items)
+            }
+            Response::Error { errno } => Err(ClientError::Errno(errno)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
 }
 
 fn spawn_reader<R: FrameStream>(
@@ -530,13 +557,22 @@ mod tests {
         PassthroughRemote<spritebox_fs_transport::InMemSink>,
         mpsc::Receiver<Push>,
     ) {
+        let (rfs, push_rx, _client) = wire_with_client().await;
+        (rfs, push_rx)
+    }
+
+    /// Variant that also returns the underlying CmdClient for tests
+    /// that exercise the raw request/Batch API.
+    async fn wire_with_client() -> (
+        PassthroughRemote<spritebox_fs_transport::InMemSink>,
+        mpsc::Receiver<Push>,
+        Arc<CmdClient<spritebox_fs_transport::InMemSink>>,
+    ) {
         let clock = Arc::new(RealClock);
         let (client_end, mut server_end, _ctrl_c2s, _ctrl_s2c) = InMemoryTransport::pair(clock);
 
-        // Host-side: dispatcher backed by MemFs.
         let dispatcher = Dispatcher::new(MemFs::with_clock(FakeClock::new(1_000_000)));
 
-        // Spawn host loop: read requests, dispatch, send responses.
         tokio::spawn(async move {
             while let Some(frame) = server_end.stream.recv().await {
                 if let Frame::Request { id, body } = frame {
@@ -550,7 +586,8 @@ mod tests {
 
         let (push_tx, push_rx) = mpsc::channel(16);
         let client = CmdClient::new(client_end.sink, client_end.stream, push_tx);
-        (PassthroughRemote::new(client), push_rx)
+        let rfs = PassthroughRemote::new(client.clone());
+        (rfs, push_rx, client)
     }
 
     #[tokio::test]
@@ -662,5 +699,53 @@ mod tests {
             out.push(f.await);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn batch_request_returns_all_results_in_order() {
+        let (rfs, _, client) = wire_with_client().await;
+        // Pre-create a few entries so getattr works.
+        for n in &["alpha", "beta", "gamma"] {
+            rfs.create(ROOT_INO, n, 0o644, open_flags()).await.unwrap();
+        }
+        let alpha = rfs.lookup(ROOT_INO, "alpha").await.unwrap();
+        let beta = rfs.lookup(ROOT_INO, "beta").await.unwrap();
+        let gamma = rfs.lookup(ROOT_INO, "gamma").await.unwrap();
+
+        // Send three GetAttrs in one Batch frame.
+        let batch = vec![
+            Request::GetAttr { ino: alpha.ino },
+            Request::GetAttr { ino: beta.ino },
+            Request::GetAttr { ino: gamma.ino },
+        ];
+        let results = client.request_batch(batch).await.unwrap();
+        assert_eq!(results.len(), 3);
+        for (i, expected_ino) in [alpha.ino, beta.ino, gamma.ino].iter().enumerate() {
+            match &results[i] {
+                Response::Attr(a) => assert_eq!(a.ino, *expected_ino),
+                other => panic!("slot {i}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_nesting() {
+        let (_rfs, _, client) = wire_with_client().await;
+        let nested = Request::Batch(vec![Request::GetAttr { ino: ROOT_INO }]);
+        let outer = vec![nested];
+        let result = client.request_batch(outer).await;
+        // Host returns Response::Error for nested batch — surfaces as
+        // ClientError::Errno(EINVAL) per request_batch's mapping.
+        match result {
+            Err(ClientError::Errno(errno)) if errno == e::EINVAL => {}
+            other => panic!("expected EINVAL, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_empty_input_returns_empty_output() {
+        let (_rfs, _, client) = wire_with_client().await;
+        let result = client.request_batch(Vec::new()).await.unwrap();
+        assert!(result.is_empty());
     }
 }

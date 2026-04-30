@@ -176,7 +176,55 @@ impl<F: HostFs> Dispatcher<F> {
             Request::ReadLink { ino } => self.readlink(ino).await,
             Request::Fsync { ino, .. } => self.fsync(ino).await,
             Request::StatFs { .. } => Response::StatFs(default_statfs()),
+            Request::Batch(inner) => self.dispatch_batch(inner).await,
         }
+    }
+
+    /// Dispatch a batch of requests, processing them in parallel and
+    /// preserving order in the response. Refuses nested Batch — would
+    /// otherwise let a malicious client amplify load arbitrarily by
+    /// sending Batch(Batch(Batch(...))).
+    fn dispatch_batch(
+        &self,
+        inner: Vec<Request>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>>
+    where
+        F: 'static,
+    {
+        Box::pin(async move {
+            use tokio::task::JoinSet;
+            let mut set: JoinSet<(usize, Response)> = JoinSet::new();
+            for (idx, req) in inner.into_iter().enumerate() {
+                // Reject nested Batch.
+                if matches!(req, Request::Batch(_)) {
+                    return Response::Error {
+                        errno: spritebox_fs_protocol::errno::EINVAL,
+                    };
+                }
+                let me = self.clone();
+                set.spawn(async move {
+                    let resp: Response = me.dispatch(req).await;
+                    (idx, resp)
+                });
+            }
+            let total = set.len();
+            let mut out: Vec<Option<Response>> =
+                (0..total).map(|_| None).collect();
+            while let Some(joined) = set.join_next().await {
+                let (idx, resp) = match joined {
+                    Ok(pair) => pair,
+                    Err(_) => {
+                        return Response::Error {
+                            errno: spritebox_fs_protocol::errno::EIO,
+                        };
+                    }
+                };
+                out[idx] = Some(resp);
+            }
+            Response::Batch(
+                out.into_iter().map(|r| r.expect("filled")).collect(),
+            )
+        })
     }
 
     async fn resolve_ino(&self, ino: spritebox_fs_protocol::Ino) -> Result<PathBuf, Response> {
