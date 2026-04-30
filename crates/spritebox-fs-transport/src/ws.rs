@@ -94,10 +94,14 @@ where
 ///
 /// Reads `0x01`-prefixed binary WS messages, accumulates the body bytes,
 /// and parses out length-prefixed JSON Frames as they become available.
+///
+/// Optionally forwards `0x02`-prefixed stderr to a caller-supplied
+/// channel so daemon error messages don't get silently dropped.
 pub struct WsFrameStream<S> {
     stream: SplitStream<TwsStream<S>>,
     buffer: VecDeque<u8>,
     closed: bool,
+    stderr_tx: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
 }
 
 impl<S> WsFrameStream<S>
@@ -109,7 +113,19 @@ where
             stream,
             buffer: VecDeque::new(),
             closed: false,
+            stderr_tx: None,
         }
+    }
+
+    /// Forward `0x02` stderr bytes to the given channel instead of
+    /// dropping them. Useful for surfacing daemon error output to the
+    /// user's terminal.
+    pub fn with_stderr(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    ) -> Self {
+        self.stderr_tx = Some(tx);
+        self
     }
 
     /// Pull the next chunk of bytes out of the WS into our buffer.
@@ -123,7 +139,13 @@ where
                             self.buffer.extend(&data[1..]);
                             return true;
                         }
-                        // stderr / exit-code / unknown — ignore.
+                        0x02 => {
+                            if let Some(tx) = &self.stderr_tx {
+                                let _ = tx.send(Bytes::copy_from_slice(&data[1..]));
+                            }
+                            continue;
+                        }
+                        // exit-code / unknown — ignore.
                         _ => continue,
                     }
                 }

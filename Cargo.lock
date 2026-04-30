@@ -1536,6 +1536,7 @@ dependencies = [
 name = "spritebox"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "crossterm",
  "futures-util",

@@ -174,14 +174,33 @@ pub async fn prepare(
     let ws = client
         .open_exec(
             sprite_name,
-            &["/usr/local/bin/spritebox-fsd", "--mount", &spec.remote],
-            &[],
+            &[
+                "/usr/local/bin/spritebox-fsd",
+                "--mount",
+                &spec.remote,
+                "--verbose",
+            ],
+            &[("RUST_LOG", "info")],
             None,
         )
         .await?;
     let (sink, stream) = ws.split();
     let frame_sink = WsFrameSink::new(sink);
-    let frame_stream = WsFrameStream::new(stream);
+
+    // Forward daemon stderr to our own stderr so mount errors etc. are
+    // visible. Spawn a small task to drain the channel.
+    let (stderr_tx, mut stderr_rx) =
+        tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+    let frame_stream = WsFrameStream::new(stream).with_stderr(stderr_tx);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut stderr = tokio::io::stderr();
+        while let Some(chunk) = stderr_rx.recv().await {
+            let prefixed: Vec<u8> = b"[fsd] ".iter().copied().chain(chunk.iter().copied()).collect();
+            let _ = stderr.write_all(&prefixed).await;
+            let _ = stderr.flush().await;
+        }
+    });
 
     Ok(Share {
         spec,
