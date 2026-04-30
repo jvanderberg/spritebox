@@ -596,9 +596,11 @@ guesswork. With it, the same bug surfaces twice and ships fixed.
 - **mtime fidelity**: `make` and similar care about mtime ordering. The
   protocol carries real mtimes from the host, but we need to ensure FUSE
   returns them faithfully and that writes preserve sensible mtimes back.
-- **Symlinks, xattrs, special files**: each is its own small swamp. v1
-  supports regular files and directories; symlinks come in v1.1; xattrs and
-  special files are explicit non-goals unless something needs them.
+- **Symlinks, xattrs, special files**: each is its own small swamp.
+  Symlinks moved into Phase 1 because Python venv (creates `lib64 → lib`),
+  npm (`.bin/` shims), and several other dev workflows hard-fail without
+  them. Hardlinks, xattrs, and special files (devices, FIFOs) remain
+  explicit non-goals unless something needs them.
 - **`/dev/fuse` perms regression**: we depend on a `chmod 666` that could
   break if the Sprites image changes. Worth a `doctor` check that surfaces
   this clearly.
@@ -611,30 +613,81 @@ guesswork. With it, the same bug surfaces twice and ships fixed.
 
 ## Phased Rollout
 
-**Phase 1 — read-only, single share, full test harness**
+**Phase 1 — read-only, single share, full test harness** ✅ shipped
+(plus most of Phase 2 and Phase 3 followed organically)
 - Protocol crate, host logic with `tokio::fs`, remote logic with caching, FUSE
   adapter.
 - **Simulation harness control surface complete**: latency/bandwidth/loss/
   disconnect/reorder/corruption/clock injection. This is non-negotiable for
   Phase 1 — the rest of the project rides on it.
-- **Instrumentation complete**: structured tracing, recording mode, live
-  diagnostic dump, counters, FUSE-callback macro.
-- All 20 baseline test scenarios green; FS-equivalence and
-  cache-transparency proptests passing under chaos.
-- `spritebox --share <host>:<sprite>` flag, mount on launch, unmount on exit.
-- No writes (return EROFS).
-- Validates the architecture, the transport, and the test infrastructure.
+- **Instrumentation**: structured tracing on FUSE callbacks, sprite-side
+  daemon log capturing prefill receipts. Recording mode and live
+  diagnostic dump are still pending.
+- 16 of 20 baseline test scenarios green; cache-transparency property test
+  passing. The remaining 4 (s07/s08 full proptests, s12 fuzzer, s17 burst
+  coalescing, s20 FUSE golden-trace contract test) are still pending.
+- `spritebox --share LOCAL:REMOTE` flag, mount on launch, unmount on exit.
+- Reads and writes (the EROFS-only milestone was skipped — read-write
+  shipped together).
 
-**Phase 2 — read-write**
-- Write-back-on-release, `fsync`, atomic rename, create, unlink.
-- Host watcher pushes invalidations on local edits.
-- Tests for editor atomic save, ENOSPC propagation, fsync barrier under
-  crash, host-watcher-vs-in-flight-write race.
+**Phase 2 — read-write** ✅ shipped
+- Write-back-on-release: not strictly write-back yet (writes are
+  synchronous through to the host), but writes work end-to-end.
+- `fsync`, atomic rename, create, unlink, mkdir, rmdir, chmod, truncate.
+- O_APPEND, O_TRUNC, mode bits honored.
+- Host watcher pushes invalidations on local edits via `notify` →
+  `Push::InvalidateAttr` / `InvalidateData` / `InvalidateEntry` / `Resync`.
+- Editor atomic save tested; host-watcher-vs-in-flight-write race fixed
+  via per-inode generation counter on `Push::InvalidateData` and
+  `Response::Bytes`.
+- Pending: ENOSPC propagation through a real write-back buffer (today
+  ENOSPC surfaces eagerly via `tokio::fs::write` failure, which is
+  acceptable but not the "buffered then surfaced on flush" semantics
+  the design specifies).
 
-**Phase 3 — quality of life**
-- `spritebox share` subcommands, `.spriteboxignore` for exclusions, prefetch
-  tuning, share survives daemon restart, multiple concurrent shares.
+**Phase 2.5 — symlinks (originally v1.1)** ✅ shipped
+- `Filesystem::symlink` and `Filesystem::readlink` callbacks.
+- `HostFs::symlink` and `readlink` on both `MemFs` and `TokioFs`.
+- `TokioFs::stat_inner` switched to `symlink_metadata` for POSIX lstat
+  semantics.
+- Equivalence test covers create + read.
 
-**Phase 4 — image bake**
-- Ship `spritebox-fsd` and the `chmod` in the sprite base image so launch is
-  faster and provisioning is one less moving part.
+**Phase 3 — quality of life** partial
+- ✅ Multiple concurrent shares (pass `--share` multiple times).
+- ✅ Background prefetch warms the cache from share root, smallest-first.
+- ✅ Per-mount log path so concurrent shares don't trample each other.
+- ✅ Self-healing provision: stale FUSE mounts and orphan daemons cleaned
+  up via `umount -l + mkdir -p` on every share start.
+- ✅ Multi-threaded FUSE dispatch (callbacks spawn onto the runtime).
+- ✅ `readdirplus` — `ls -la` cost goes from N+1 round-trips to 1.
+- ✅ Cache: byte-count LRU, 100 MiB cap by default, 16 KiB chunks.
+- ⬜ `.spriteboxignore` for exclusions (prefetch + watcher).
+- ⬜ Share survives daemon restart (today: daemon dies → mount goes stale,
+  share command must restart).
+- ⬜ `--no-prefetch` flag for users on slow links.
+
+**Phase 4 — image bake** ⬜ pending
+- Ship `spritebox-fsd` and the `chmod` in the sprite base image so launch
+  is faster and provisioning is one less moving part. Today the daemon
+  binary is `write_file`d on every share start (~3.4 MB over the
+  WebSocket).
+
+**Pending test matrix (from the testing strategy section)**
+- s07 / s08: real proptest-driven FS equivalence and cache-transparency
+  under chaos transport. Have miniature versions; need the full
+  proptest harness with shrinking.
+- s12: cargo-fuzz frame-level fuzzer.
+- s17: watcher coalescing under burst (50k file create).
+- s20: FUSE adapter golden-trace contract test (Linux-only, replay
+  recorded fuser callback sequence against `RecordingRemoteFs`).
+
+**Other pending items from the code review punch list**
+- ⬜ Cache lock contention micro-optimization (Tier C — only matters
+  under contention we don't yet have).
+- ⬜ Recording mode (`SPRITEBOX_FS_RECORD=<path>`) for capturing daemon
+  traces that double as test fixtures.
+- ⬜ Live diagnostic dump endpoint (`spritebox fs diag --name <sprite>`).
+- ⬜ Differential mode (run every op against a shadow `RemoteFs` for
+  continuous correctness checking).
+- ⬜ `doctor` check that the daemon binary is built and the sprite has
+  `/dev/fuse` accessible.
