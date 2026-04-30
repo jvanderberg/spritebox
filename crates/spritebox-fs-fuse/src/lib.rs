@@ -38,8 +38,18 @@ use tokio::runtime::Handle;
 /// FUSE-side default TTLs for kernel-level caching. The real cache TTLs
 /// live in `spritebox-fs-remote`; these tell the kernel how long to
 /// trust a FUSE reply.
-const ENTRY_TTL: Duration = Duration::from_secs(1);
-const ATTR_TTL: Duration = Duration::from_secs(1);
+// Long TTLs: the kernel will trust an entry/attr for this long without
+// asking us again. The host watcher publishes Push::Invalidate*
+// frames eagerly when the underlying file changes (and our daemon
+// forwards those to the kernel via fuser notifications in future
+// work), so coherence isn't lost from a long TTL — only the failure
+// mode of "user changed file outside the share" gets a 60s lag, which
+// is acceptable for this use case.
+//
+// Without this bump, every cargo build re-issues thousands of lookups
+// across re-checks because the 1-second window expires constantly.
+const ENTRY_TTL: Duration = Duration::from_secs(60);
+const ATTR_TTL: Duration = Duration::from_secs(60);
 const GENERATION: u64 = 1;
 
 /// FUSE-mountable adapter. Constructed with a runtime handle (so callbacks
@@ -175,6 +185,16 @@ impl Filesystem for SpriteboxFs {
                 "kernel rejected requested FUSE capabilities"
             );
         }
+
+        // Bigger I/O sizes: the kernel uses these to cap per-callback
+        // request sizes. Defaults are conservative (~128 KiB write).
+        // Bump to 1 MiB so the kernel coalesces sequential reads /
+        // writes into bigger chunks, halving the WAN round-trip count
+        // for large-file operations.
+        let target_io = 1024 * 1024;
+        let _ = config.set_max_write(target_io);
+        let _ = config.set_max_readahead(target_io);
+
         Ok(())
     }
 
