@@ -694,18 +694,27 @@ impl SpritesClient {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 4096];
 
-        // Handle SIGWINCH for resize via a separate task
+        // Handle SIGWINCH for resize via a separate task. SIGWINCH is
+        // a Unix-only concept (Windows uses ReadConsoleInput events)
+        // so on Windows we just leave the resize channel idle —
+        // the user can resize their terminal but the sprite won't be
+        // notified. Acceptable trade-off vs. building a Windows-
+        // specific resize listener.
         let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(4);
+        #[cfg(unix)]
         tokio::spawn(async move {
             let mut sigwinch = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::window_change(),
-            ).expect("failed to register SIGWINCH");
+            )
+            .expect("failed to register SIGWINCH");
             while sigwinch.recv().await.is_some() {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
                     let _ = resize_tx.send((cols, rows)).await;
                 }
             }
         });
+        #[cfg(not(unix))]
+        let _ = resize_tx;
 
         loop {
             tokio::select! {
