@@ -235,16 +235,6 @@ pub struct PassthroughRemote<S: FrameSink> {
     client: Arc<CmdClient<S>>,
 }
 
-// Manual Clone impl: Arc<T> is Clone regardless of T's Clone bound,
-// but the derive macro defaults to requiring `S: Clone`.
-impl<S: FrameSink> Clone for PassthroughRemote<S> {
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-        }
-    }
-}
-
 impl<S: FrameSink> PassthroughRemote<S> {
     pub fn new(client: Arc<CmdClient<S>>) -> Self {
         Self { client }

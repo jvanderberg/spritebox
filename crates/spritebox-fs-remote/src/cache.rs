@@ -21,7 +21,7 @@
 //! [`PassthroughRemote`] — that's the contract the cache-transparency
 //! proptest enforces.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -84,11 +84,6 @@ struct CacheState {
     /// returns a strictly-lower generation has been overtaken by an
     /// invalidation and must NOT be inserted into the content cache.
     inode_generation: HashMap<Ino, u64>,
-    /// Per-inode write-back state. Created lazily on first write to an
-    /// ino, kept around until the inode is invalidated or release
-    /// drains the buffer. Reads consult dirty_extents as an overlay
-    /// before falling through to content cache + host.
-    write_back: HashMap<Ino, InodeWriteBack>,
     /// Stats for tests / diagnostics.
     hits_attr: u64,
     misses_attr: u64,
@@ -97,52 +92,6 @@ struct CacheState {
     hits_negative: u64,
     stale_fetches_dropped: u64,
 }
-
-/// Per-inode write-back state.
-///
-/// Each ino gets a dedicated tokio task (the "flush worker") that
-/// drains a bounded mpsc channel of FlushOps in send order. Writes are
-/// pushed to the channel and return Ok immediately; reads consult
-/// `dirty_extents` for any byte range that has buffered writes. The
-/// FUSE-level guarantees we maintain:
-///
-/// - Per-handle write order is preserved (FIFO through the channel).
-/// - Reads observe prior writes from any handle on the same sprite.
-/// - Errors from any flushed write are sticky and surfaced on the
-///   next `release()` or `fsync()`.
-struct InodeWriteBack {
-    /// Dirty extents indexed by offset. Inserted on every write, cleared
-    /// on barrier success in release/fsync.
-    dirty_extents: BTreeMap<u64, bytes::Bytes>,
-    /// Sum of dirty bytes — for memory pressure metrics.
-    bytes_dirty: usize,
-    /// Bounded channel that feeds the flush worker. Sender is held by
-    /// the cache; receiver is owned by the worker. Bounded so writes
-    /// apply backpressure to the kernel when the worker can't keep up.
-    flush_tx: mpsc::Sender<FlushOp>,
-    /// First error encountered by the flush worker — sticky until
-    /// surfaced via barrier or release. The field is held as an Arc
-    /// shared with the worker; reads happen worker-side, not directly
-    /// from the struct, so `dead_code` would otherwise complain.
-    #[allow(dead_code)]
-    first_error: Arc<std::sync::Mutex<Option<ClientError>>>,
-}
-
-enum FlushOp {
-    /// A single write, sent to the host in order.
-    Write {
-        offset: u64,
-        data: bytes::Bytes,
-        handle: u64,
-    },
-    /// Caller wants confirmation that all prior writes have completed
-    /// (or surface the first error). Sent on release/fsync.
-    Barrier {
-        ack: tokio::sync::oneshot::Sender<ClientResult<()>>,
-    },
-}
-
-const FLUSH_QUEUE_CAPACITY: usize = 256;
 
 pub struct CachedRemote<S: FrameSink> {
     inner: PassthroughRemote<S>,
@@ -157,7 +106,6 @@ impl<S: FrameSink> CachedRemote<S> {
             lookups: HashMap::new(),
             content: ContentCache::new(config.content),
             inode_generation: HashMap::new(),
-            write_back: HashMap::new(),
             hits_attr: 0,
             misses_attr: 0,
             hits_lookup: 0,
@@ -247,64 +195,6 @@ impl<S: FrameSink> CachedRemote<S> {
         })
     }
 
-    /// Get the write-back state for `ino`, creating + spawning the
-    /// flush worker if one doesn't yet exist. The state lock is held
-    /// briefly; the spawned worker takes ownership of its receiver and
-    /// runs independently of the cache lock.
-    fn ensure_writeback<'a>(
-        &self,
-        s: &'a mut CacheState,
-        ino: Ino,
-    ) -> &'a mut InodeWriteBack {
-        if !s.write_back.contains_key(&ino) {
-            let (tx, rx) = mpsc::channel(FLUSH_QUEUE_CAPACITY);
-            let first_error = Arc::new(std::sync::Mutex::new(None));
-            spawn_flush_worker(self.inner.clone(), ino, rx, first_error.clone());
-            s.write_back.insert(
-                ino,
-                InodeWriteBack {
-                    dirty_extents: BTreeMap::new(),
-                    bytes_dirty: 0,
-                    flush_tx: tx,
-                    first_error,
-                },
-            );
-        }
-        s.write_back.get_mut(&ino).unwrap()
-    }
-
-    /// Send a Barrier through the per-ino flush queue and await ack.
-    /// Used by release/fsync to drain pending writes and surface
-    /// errors. After successful drain, dirty extents are cleared
-    /// (the host now has the canonical bytes).
-    async fn flush_writeback(&self, ino: Ino) -> ClientResult<()> {
-        let (sender, ack_rx) = {
-            let mut s = self.state.lock().await;
-            let Some(wb) = s.write_back.get(&ino) else {
-                return Ok(());
-            };
-            let tx = wb.flush_tx.clone();
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            (tx, (ack_tx, ack_rx))
-        };
-        let (ack_tx, ack_rx) = ack_rx;
-        if sender.send(FlushOp::Barrier { ack: ack_tx }).await.is_err() {
-            return Err(ClientError::Disconnected);
-        }
-        let result = match ack_rx.await {
-            Ok(r) => r,
-            Err(_) => Err(ClientError::Disconnected),
-        };
-        // Clear dirty entries — they're now on the host (or we have an
-        // error and reads should re-fetch from the host's truth).
-        let mut s = self.state.lock().await;
-        if let Some(wb) = s.write_back.get_mut(&ino) {
-            wb.dirty_extents.clear();
-            wb.bytes_dirty = 0;
-        }
-        result
-    }
-
     /// Snapshot of cache statistics. Cheap to call, locks briefly.
     pub async fn stats(&self) -> CacheStats {
         let s = self.state.lock().await;
@@ -343,119 +233,6 @@ pub struct CacheStats {
     pub bytes_evicted_content: u64,
     pub stale_fetches_dropped: u64,
     pub content_bytes: usize,
-}
-
-/// Per-inode flush worker. Drains FlushOps in send order, calls
-/// inner.write for each Write, sends ack for each Barrier with the
-/// sticky first error if any.
-fn spawn_flush_worker<S: FrameSink>(
-    inner: PassthroughRemote<S>,
-    ino: Ino,
-    mut rx: mpsc::Receiver<FlushOp>,
-    first_error: Arc<std::sync::Mutex<Option<ClientError>>>,
-) {
-    tokio::spawn(async move {
-        while let Some(op) = rx.recv().await {
-            match op {
-                FlushOp::Write {
-                    offset,
-                    data,
-                    handle,
-                } => {
-                    let result = inner.write(ino, handle, offset, &data).await;
-                    if let Err(e) = result {
-                        let mut err = first_error.lock().unwrap();
-                        if err.is_none() {
-                            *err = Some(e);
-                        }
-                    }
-                }
-                FlushOp::Barrier { ack } => {
-                    let snapshot = first_error.lock().unwrap().clone();
-                    let result = match snapshot {
-                        Some(e) => Err(e),
-                        None => Ok(()),
-                    };
-                    let _ = ack.send(result);
-                }
-            }
-        }
-    });
-}
-
-/// Adjust a host-reported FileAttr to account for buffered writes
-/// that haven't reached the host yet. The size becomes
-/// `max(host_size, max_dirty_extent_end)` so callers see a coherent
-/// view: a getattr right after a write returns the new size, not the
-/// stale on-disk size. Other fields (mode, mtime, etc.) pass through
-/// — only size needs adjustment for write-back coherence.
-fn overlay_attr_size(s: &CacheState, ino: Ino, mut attr: FileAttr) -> FileAttr {
-    if let Some(wb) = s.write_back.get(&ino) {
-        let mut max_end = attr.size;
-        for (off, data) in wb.dirty_extents.iter() {
-            let end = off.saturating_add(data.len() as u64);
-            if end > max_end {
-                max_end = end;
-            }
-        }
-        attr.size = max_end;
-    }
-    attr
-}
-
-/// Overlay dirty extents on top of the bytes returned by the
-/// content-cache + host fetch path.
-///
-/// `read_offset` is the requested read's start offset; `read_bytes` is
-/// the data returned from cache/host for the range
-/// `[read_offset, read_offset + read_bytes.len())`. For each dirty
-/// extent that overlaps this range, the dirty bytes overwrite the
-/// corresponding slice of `read_bytes`.
-async fn overlay_dirty(
-    state: &Arc<Mutex<CacheState>>,
-    ino: Ino,
-    read_offset: u64,
-    read_bytes: Bytes,
-) -> Bytes {
-    let s = state.lock().await;
-    let Some(wb) = s.write_back.get(&ino) else {
-        return read_bytes;
-    };
-    if wb.dirty_extents.is_empty() {
-        return read_bytes;
-    }
-    let read_end = read_offset.saturating_add(read_bytes.len() as u64);
-
-    // Collect all dirty extents that overlap [read_offset, read_end).
-    // BTreeMap allows efficient range queries — but we need extents
-    // whose [extent_offset, extent_offset + extent_len) intersects
-    // the read range. Since we don't know extent_len without looking,
-    // we have to scan from the largest offset <= read_offset onward
-    // (any earlier extent might still overlap if it's long enough).
-    // For typical workloads (cargo writes smallish extents) this is
-    // bounded; if it becomes a hot path we can add per-extent length
-    // indexing.
-    let mut overlaid = read_bytes.to_vec();
-    for (extent_offset, extent_data) in wb.dirty_extents.iter() {
-        let extent_offset = *extent_offset;
-        let extent_end = extent_offset.saturating_add(extent_data.len() as u64);
-        if extent_end <= read_offset || extent_offset >= read_end {
-            continue;
-        }
-        let copy_start = extent_offset.max(read_offset);
-        let copy_end = extent_end.min(read_end);
-        let dst_start = (copy_start - read_offset) as usize;
-        let dst_end = (copy_end - read_offset) as usize;
-        let src_start = (copy_start - extent_offset) as usize;
-        let src_end = (copy_end - extent_offset) as usize;
-        // Bounds-check defensively; an off-by-one here would corrupt user
-        // data silently, which is the worst possible outcome.
-        if dst_end > overlaid.len() || src_end > extent_data.len() {
-            continue;
-        }
-        overlaid[dst_start..dst_end].copy_from_slice(&extent_data[src_start..src_end]);
-    }
-    Bytes::from(overlaid)
 }
 
 fn apply_push(s: &mut CacheState, push: Push) {
@@ -583,7 +360,7 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
                 && entry.expires_at > now
             {
                 s.hits_attr += 1;
-                return Ok(overlay_attr_size(&s, ino, entry.attr));
+                return Ok(entry.attr);
             }
             s.misses_attr += 1;
         }
@@ -596,7 +373,7 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
                 expires_at: now + self.config.attr_ttl,
             },
         );
-        Ok(overlay_attr_size(&s, ino, attr))
+        Ok(attr)
     }
 
     async fn readdir(&self, ino: Ino, offset: u64) -> ClientResult<DirPage> {
@@ -642,13 +419,7 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
     }
 
     async fn release(&self, ino: Ino, handle: u64) -> ClientResult<()> {
-        // Drain any buffered writes for this ino before forwarding the
-        // release. Errors from the buffered writes surface here — this
-        // is the POSIX-compatible way to report write-back errors that
-        // happened after write() returned Ok.
-        let flush_result = self.flush_writeback(ino).await;
-        let release_result = self.inner.release(ino, handle).await;
-        flush_result.and(release_result)
+        self.inner.release(ino, handle).await
     }
 
     async fn read(
@@ -661,19 +432,10 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         let chunk_size = self.config.content.chunk_size as u64;
         if size as u64 > chunk_size * 4 || chunk_size == 0 {
             // Don't cache pathologically large reads; pass through.
-            // Note: this path skips dirty-extent overlay too. Reads
-            // larger than 4 chunks are an unusual pattern; revisit if
-            // it bites.
             return self.inner.read(ino, handle, offset, size).await;
         }
 
-        // Pre-allocate a `size`-byte buffer of zeros. We'll copy host
-        // bytes into the leading portion and overlay dirty extents on
-        // top. Anywhere outside both is a hole — POSIX semantics.
-        let req_size = size as usize;
-        let mut out: Vec<u8> = vec![0u8; req_size];
-        let mut host_eof_within_request: usize = 0;
-
+        let mut out: Vec<u8> = Vec::with_capacity(size as usize);
         let mut cur_offset = offset;
         let mut remaining = size as u64;
 
@@ -690,10 +452,24 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
             let chunk_bytes = match chunk_bytes {
                 Some(b) => b,
                 None => {
-                    // Snapshot the seen generation BEFORE fetching. If
-                    // an InvalidateData arrives at the sprite while
-                    // we're fetching, the response will get dropped
-                    // on insert (see hashed comparison below).
+                    // Snapshot the seen generation BEFORE fetching. If a
+                    // push arrives during the await advancing the gen,
+                    // we'll see seen_before < returned_gen — actually
+                    // that's the OPPOSITE of what we want. We want: if
+                    // any push arrives while the fetch is in flight,
+                    // refuse to cache. We achieve that by comparing the
+                    // generation we knew about pre-fetch with the gen
+                    // stamped on the response: if `seen_before <`
+                    // response_gen, the host advanced before serving;
+                    // that means our snapshot was stale and the
+                    // response is the new truth — safe to cache (the
+                    // host stamped the new gen). The race we care
+                    // about is when an InvalidateData arrives at the
+                    // sprite *after* the response was emitted but
+                    // *before* we insert. In that case the sprite's
+                    // seen-gen has been bumped to the new gen, which
+                    // is *higher* than the response's stamped gen —
+                    // and we refuse the insert.
                     let seen_before = {
                         let s = self.state.lock().await;
                         s.inode_generation.get(&ino).copied().unwrap_or(0)
@@ -706,11 +482,18 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
                     {
                         let mut s = self.state.lock().await;
                         let now_seen = s.inode_generation.get(&ino).copied().unwrap_or(0);
+                        // If a push raised the seen generation past the
+                        // response's stamped generation while we were
+                        // fetching, the response is stale.
                         if now_seen > response_gen {
                             s.stale_fetches_dropped += 1;
                         } else {
                             s.content.insert(ino, chunk_idx, fetched.clone());
-                            let entry = s.inode_generation.entry(ino).or_insert(0);
+                            // Track the host's view. seen_before is
+                            // referenced for clarity but only the max
+                            // matters.
+                            let entry =
+                                s.inode_generation.entry(ino).or_insert(0);
                             let max_gen = response_gen.max(seen_before).max(*entry);
                             *entry = max_gen;
                         }
@@ -719,66 +502,21 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
                 }
             };
 
-            let host_short = chunk_bytes.len() < chunk_size as usize;
-
-            if off_in_chunk < chunk_bytes.len() {
-                let take = (chunk_bytes.len() - off_in_chunk).min(remaining as usize);
-                let dst = (cur_offset - offset) as usize;
-                out[dst..dst + take]
-                    .copy_from_slice(&chunk_bytes[off_in_chunk..off_in_chunk + take]);
-                host_eof_within_request = host_eof_within_request.max(dst + take);
-                cur_offset += take as u64;
-                remaining -= take as u64;
-            } else {
-                // off_in_chunk past the end of returned bytes → host EOF
-                // is here. Don't break — keep iterating so dirty
-                // extents past this point can still be overlaid below.
-                cur_offset = (chunk_idx + 1) * chunk_size;
-                if cur_offset >= offset + size as u64 {
-                    break;
-                }
-                remaining = (offset + size as u64).saturating_sub(cur_offset);
+            if off_in_chunk >= chunk_bytes.len() {
+                // EOF inside this chunk.
+                break;
             }
+            let take = (chunk_bytes.len() - off_in_chunk).min(remaining as usize);
+            out.extend_from_slice(&chunk_bytes[off_in_chunk..off_in_chunk + take]);
+            cur_offset += take as u64;
+            remaining -= take as u64;
 
-            if host_short && off_in_chunk + (host_eof_within_request - (cur_offset - offset) as usize)
-                <= chunk_bytes.len()
-            {
-                // Host returned a short chunk → we've passed the host
-                // file's end. Stop fetching but let overlay extend the
-                // result if dirty extents reach further.
+            if chunk_bytes.len() < chunk_size as usize {
+                // The chunk was short — that means we've hit EOF.
                 break;
             }
         }
-
-        // Overlay dirty extents on top of host bytes. Compute effective
-        // EOF as max(host's last filled byte within request,
-        // max dirty extent end clipped to request) — that determines
-        // how many bytes we return.
-        let dirty_eof_within_request = {
-            let s = self.state.lock().await;
-            match s.write_back.get(&ino) {
-                Some(wb) => wb
-                    .dirty_extents
-                    .iter()
-                    .filter_map(|(off, data)| {
-                        let end = off.saturating_add(data.len() as u64);
-                        if end <= offset {
-                            None
-                        } else {
-                            Some(end.min(offset + size as u64))
-                        }
-                    })
-                    .max()
-                    .map(|end| (end - offset) as usize)
-                    .unwrap_or(0),
-                None => 0,
-            }
-        };
-
-        let effective_eof = host_eof_within_request.max(dirty_eof_within_request);
-        out.truncate(effective_eof);
-        let result_bytes = Bytes::from(out);
-        Ok(overlay_dirty(&self.state, ino, offset, result_bytes).await)
+        Ok(Bytes::from(out))
     }
 
     async fn read_with_generation(
@@ -802,65 +540,17 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         offset: u64,
         data: &[u8],
     ) -> ClientResult<u32> {
-        // Write-back: insert into the per-ino dirty buffer, push the
-        // host-write into the per-ino flush queue, and return Ok
-        // immediately. The kernel's next FUSE write doesn't have to
-        // wait for a WAN round-trip.
-        //
-        // Errors that occur during the actual host write are sticky —
-        // they surface on the next release/fsync via flush_writeback.
-        // POSIX explicitly allows this: write(2) "may fail to detect
-        // some I/O errors that happen after a successful write."
-        let bytes = bytes::Bytes::copy_from_slice(data);
-        let len = bytes.len();
-
-        // Acquire the flush channel under the state lock briefly, then
-        // release it before sending so we don't hold the global cache
-        // lock across the channel's await.
-        let flush_tx = {
+        // Writes invalidate attr cache (size/mtime change) and content
+        // cache for the affected range. Also bumps the seen generation
+        // so any in-flight read fetch from before this write is dropped.
+        let result = self.inner.write(ino, handle, offset, data).await;
+        if result.is_ok() {
             let mut s = self.state.lock().await;
-            // Update cache invariants synchronously (the kernel's next
-            // op might be a read on the same range — we can answer it
-            // from the dirty buffer without the host even seeing the
-            // write yet).
             s.attrs.remove(&ino);
-            s.content.invalidate_range(ino, offset, len as u64);
+            s.content.invalidate_range(ino, offset, data.len() as u64);
             *s.inode_generation.entry(ino).or_insert(0) += 1;
-
-            let wb = self.ensure_writeback(&mut s, ino);
-            // Track this extent in dirty_extents for read overlay. If
-            // an extent at the same offset already exists, it gets
-            // overwritten — correct, since the new write supersedes
-            // the old one.
-            wb.bytes_dirty = wb
-                .bytes_dirty
-                .saturating_sub(
-                    wb.dirty_extents
-                        .get(&offset)
-                        .map(|b| b.len())
-                        .unwrap_or(0),
-                )
-                .saturating_add(len);
-            wb.dirty_extents.insert(offset, bytes.clone());
-            wb.flush_tx.clone()
-        };
-
-        // Send the FlushOp. Bounded channel applies backpressure if
-        // the worker isn't keeping up — the FUSE thread blocks here
-        // until the channel has room. With FLUSH_QUEUE_CAPACITY=256
-        // and ~100ms RTT per host write, that's a ~25s lag tolerance.
-        if flush_tx
-            .send(FlushOp::Write {
-                offset,
-                data: bytes,
-                handle,
-            })
-            .await
-            .is_err()
-        {
-            return Err(ClientError::Disconnected);
         }
-        Ok(len as u32)
+        result
     }
 
     async fn create(
@@ -1011,12 +701,7 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
     }
 
     async fn fsync(&self, ino: Ino, handle: u64, data_only: bool) -> ClientResult<()> {
-        // Drain buffered writes before fsync. fsync's contract: by
-        // the time it returns, the data is persisted on the host. So
-        // we must wait for the per-ino flush queue to drain.
-        let flush_result = self.flush_writeback(ino).await;
-        let fsync_result = self.inner.fsync(ino, handle, data_only).await;
-        flush_result.and(fsync_result)
+        self.inner.fsync(ino, handle, data_only).await
     }
 
     async fn statfs(&self, ino: Ino) -> ClientResult<StatFs> {
@@ -1223,10 +908,6 @@ mod tests {
             .unwrap();
         let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
         cached.write(attr.ino, fh, 0, b"hello-world-xyz!").await.unwrap();
-        // Flush the write through to the host so subsequent reads
-        // exercise the content cache (writes alone live in the
-        // dirty-extent overlay and would short-circuit the cache).
-        cached.fsync(attr.ino, fh, false).await.unwrap();
 
         // First read populates the cache.
         let r1 = cached.read(attr.ino, fh, 0, 16).await.unwrap();
@@ -1274,9 +955,7 @@ mod tests {
             ..Default::default()
         };
         let (cached, _fs, _) = rig(cfg).await;
-        // Three files, three chunks → forces eviction. Fsync each
-        // before reading so the read populates the content cache (not
-        // the dirty-extent overlay).
+        // Three files, three chunks → forces eviction.
         for n in &["a", "b", "c"] {
             let attr = cached
                 .create(ROOT_INO, n, 0o644, rw_flags())
@@ -1284,7 +963,6 @@ mod tests {
                 .unwrap();
             let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
             cached.write(attr.ino, fh, 0, b"data-data-data!").await.unwrap();
-            cached.fsync(attr.ino, fh, false).await.unwrap();
             cached.read(attr.ino, fh, 0, 16).await.unwrap();
         }
         let stats = cached.stats().await;
@@ -1308,9 +986,6 @@ mod tests {
             .unwrap();
         let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
         cached.write(attr.ino, fh, 0, b"FROM-SPRITE!!!!!").await.unwrap();
-        // Flush so the host has the sprite's bytes; otherwise the
-        // dirty overlay would mask the host edit below.
-        cached.fsync(attr.ino, fh, false).await.unwrap();
         cached.read(attr.ino, fh, 0, 16).await.unwrap();
 
         // Host edits the file directly.
@@ -1323,7 +998,7 @@ mod tests {
                 ino: attr.ino,
                 offset: 0,
                 len: 16,
-                generation: 99,
+                generation: 1,
             })
             .await
             .unwrap();
@@ -1331,40 +1006,6 @@ mod tests {
 
         let bytes = cached.read(attr.ino, fh, 0, 16).await.unwrap();
         assert_eq!(&bytes[..], b"FROM-HOST!!!!!!!");
-    }
-
-    /// Write-back: a write+read on the same handle returns the just-
-    /// written bytes from the dirty-extent overlay before they reach
-    /// the host. fsync drains the buffer; release also drains. The
-    /// host doesn't see the bytes until flush.
-    #[tokio::test]
-    async fn write_back_read_sees_unflushed_writes() {
-        let (cached, host_fs, _) = rig(CacheConfig::default()).await;
-        let attr = cached
-            .create(ROOT_INO, "wb", 0o644, rw_flags())
-            .await
-            .unwrap();
-        let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
-
-        cached.write(attr.ino, fh, 0, b"buffered!").await.unwrap();
-        // Read on the same handle: must see the write via dirty overlay.
-        let r = cached.read(attr.ino, fh, 0, 16).await.unwrap();
-        assert_eq!(&r[..], b"buffered!");
-
-        // Read on a *different* handle to the same ino: also sees the
-        // dirty extent (it lives at the inode level, not per-handle).
-        let fh2 = cached.open(attr.ino, rw_flags()).await.unwrap();
-        let r2 = cached.read(attr.ino, fh2, 0, 16).await.unwrap();
-        assert_eq!(&r2[..], b"buffered!");
-
-        // Fsync: drain the buffer through to the host. After that, the
-        // host has the bytes too.
-        cached.fsync(attr.ino, fh, false).await.unwrap();
-        let host_bytes = host_fs
-            .read(std::path::Path::new("wb"), 0, 16)
-            .await
-            .unwrap();
-        assert_eq!(&host_bytes[..], b"buffered!");
     }
 
     /// Race coverage: an InvalidateData push that arrives BEFORE a read
@@ -1394,11 +1035,6 @@ mod tests {
             .unwrap();
         let fh = cached.open(attr.ino, rw_flags()).await.unwrap();
         cached.write(attr.ino, fh, 0, b"v1-data!!!!!!!!!").await.unwrap();
-        // Fsync so the bytes hit the host and a follow-on read
-        // populates the content cache (rather than serving from the
-        // dirty-extent overlay, which would never trigger the race
-        // path we want to exercise).
-        cached.fsync(attr.ino, fh, false).await.unwrap();
         // First read populates the cache.
         cached.read(attr.ino, fh, 0, 16).await.unwrap();
         let stats0 = cached.stats().await;
