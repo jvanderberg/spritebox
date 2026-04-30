@@ -12,6 +12,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 spritebox-fs-host = { workspace = true }

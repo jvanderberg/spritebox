@@ -1678,6 +1678,7 @@ dependencies = [
  "spritebox-fs-protocol",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1701,6 +1702,7 @@ dependencies = [
  "spritebox-fs-protocol",
  "spritebox-fs-transport",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

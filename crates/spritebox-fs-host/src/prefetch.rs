@@ -66,17 +66,33 @@ where
     // _root is reserved for future use (e.g. starting the walk at a
     // subdirectory). Currently we always walk from the share root.
     tokio::spawn(async move {
+        let walk_started = std::time::Instant::now();
         let mut entries: Vec<(PathBuf, u64)> = Vec::new();
         collect(&*fs, Path::new(""), &mut entries, config.max_file_bytes).await;
         // Smallest first — source files cache before tarballs.
         entries.sort_by_key(|(_, size)| *size);
+        let walk_ms = walk_started.elapsed().as_millis() as u64;
+        let total_eligible_bytes: u64 = entries.iter().map(|(_, s)| *s).sum();
+        tracing::info!(
+            files = entries.len(),
+            eligible_bytes = total_eligible_bytes,
+            max_file_bytes = config.max_file_bytes,
+            max_total_bytes = config.max_total_bytes,
+            walk_ms,
+            "prefetch: walked share root"
+        );
 
-        let mut shipped: u64 = 0;
+        let ship_started = std::time::Instant::now();
+        let mut shipped_bytes: u64 = 0;
+        let mut shipped_files: u64 = 0;
+        let mut shipped_chunks: u64 = 0;
+        let mut skipped_oversize: u64 = 0;
         for (path, size) in entries {
-            if shipped >= config.max_total_bytes {
+            if shipped_bytes >= config.max_total_bytes {
                 break;
             }
             if size > config.max_file_bytes {
+                skipped_oversize += 1;
                 continue;
             }
 
@@ -93,11 +109,20 @@ where
             let chunk_size = config.chunk_size as u64;
             let mut chunk_idx = 0u64;
             let mut offset = 0u64;
+            let file_started = std::time::Instant::now();
             while offset < size {
                 let to_read = chunk_size.min(size - offset) as u32;
                 let data = match fs.read(&path, offset, to_read).await {
                     Ok(b) => b,
-                    Err(_) => break,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            offset,
+                            error = ?err,
+                            "prefetch: read failed, skipping rest of file"
+                        );
+                        break;
+                    }
                 };
                 if data.is_empty() {
                     break;
@@ -111,16 +136,39 @@ where
                     generation: gen_snapshot,
                 };
                 if push_tx.send(push).await.is_err() {
+                    tracing::info!(
+                        shipped_files,
+                        shipped_chunks,
+                        shipped_bytes,
+                        "prefetch: push channel closed, exiting"
+                    );
                     return;
                 }
-                shipped = shipped.saturating_add(data_len);
+                shipped_bytes = shipped_bytes.saturating_add(data_len);
+                shipped_chunks += 1;
                 offset += data_len;
                 chunk_idx += 1;
-                if shipped >= config.max_total_bytes {
+                if shipped_bytes >= config.max_total_bytes {
                     break;
                 }
             }
+            shipped_files += 1;
+            tracing::debug!(
+                path = %path.display(),
+                size,
+                chunks = chunk_idx,
+                file_ms = file_started.elapsed().as_millis() as u64,
+                "prefetch: shipped"
+            );
         }
+        tracing::info!(
+            shipped_files,
+            shipped_chunks,
+            shipped_bytes,
+            skipped_oversize,
+            ship_ms = ship_started.elapsed().as_millis() as u64,
+            "prefetch: done"
+        );
     })
 }
 

@@ -41,7 +41,9 @@ fn main() -> Result<(), String> {
     let args = Args::parse();
 
     let env_filter = if args.verbose {
-        tracing_subscriber::EnvFilter::new("info,spritebox_fs_fuse=debug")
+        tracing_subscriber::EnvFilter::new(
+            "info,spritebox_fs_fuse=debug,spritebox_fs_remote=info",
+        )
     } else {
         tracing_subscriber::EnvFilter::from_default_env()
     };

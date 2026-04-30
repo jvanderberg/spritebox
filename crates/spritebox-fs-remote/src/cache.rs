@@ -129,9 +129,68 @@ impl<S: FrameSink> CachedRemote<S> {
     ) -> tokio::task::JoinHandle<()> {
         let state = self.state.clone();
         tokio::spawn(async move {
+            // Counters for periodic prefetch progress reports. Every
+            // PREFILL_LOG_INTERVAL prefills, emit a single info log so
+            // the user can see warmup progress in the daemon log
+            // without one log per chunk.
+            const PREFILL_LOG_INTERVAL: u64 = 64;
+            let mut prefill_count: u64 = 0;
+            let mut prefill_bytes: u64 = 0;
+            let mut prefill_dropped_chunk_size: u64 = 0;
+            let mut prefill_dropped_stale: u64 = 0;
             while let Some(push) = rx.recv().await {
-                let mut s = state.lock().await;
-                apply_push(&mut s, push);
+                let prefill_data_len = if let Push::Prefill { ref data, .. } = push {
+                    Some(data.len() as u64)
+                } else {
+                    None
+                };
+                let stale_before;
+                let chunk_size_skip_before;
+                {
+                    let mut s = state.lock().await;
+                    stale_before = s.stale_fetches_dropped;
+                    let cache_chunk_size = s.content.chunk_size();
+                    chunk_size_skip_before = if let Push::Prefill { chunk_size, .. } = push {
+                        chunk_size as usize != cache_chunk_size
+                    } else {
+                        false
+                    };
+                    apply_push(&mut s, push);
+                    if let Some(len) = prefill_data_len {
+                        if chunk_size_skip_before {
+                            prefill_dropped_chunk_size += 1;
+                        } else if s.stale_fetches_dropped > stale_before {
+                            prefill_dropped_stale += 1;
+                        } else {
+                            prefill_count += 1;
+                            prefill_bytes += len;
+                        }
+                    }
+                }
+                if prefill_data_len.is_some()
+                    && (prefill_count + prefill_dropped_chunk_size + prefill_dropped_stale)
+                        % PREFILL_LOG_INTERVAL
+                        == 0
+                    && prefill_count + prefill_dropped_chunk_size + prefill_dropped_stale > 0
+                {
+                    tracing::info!(
+                        accepted = prefill_count,
+                        bytes = prefill_bytes,
+                        dropped_chunk_size = prefill_dropped_chunk_size,
+                        dropped_stale = prefill_dropped_stale,
+                        "prefill: progress"
+                    );
+                }
+            }
+            if prefill_count > 0 || prefill_dropped_chunk_size > 0 || prefill_dropped_stale > 0
+            {
+                tracing::info!(
+                    accepted = prefill_count,
+                    bytes = prefill_bytes,
+                    dropped_chunk_size = prefill_dropped_chunk_size,
+                    dropped_stale = prefill_dropped_stale,
+                    "prefill: invalidator exiting"
+                );
             }
         })
     }
