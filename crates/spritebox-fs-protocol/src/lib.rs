@@ -147,6 +147,14 @@ pub enum Request {
         new_parent: Ino,
         new_name: String,
     },
+    Symlink {
+        parent: Ino,
+        name: String,
+        target: String,
+    },
+    ReadLink {
+        ino: Ino,
+    },
     Truncate {
         ino: Ino,
         size: u64,
@@ -243,6 +251,12 @@ pub enum Response {
         bytes: u32,
     },
     StatFs(StatFs),
+    /// Symlink target as a UTF-8 string. Symlinks may technically
+    /// contain arbitrary bytes — for now we only handle UTF-8 paths,
+    /// which covers all real-world usage.
+    LinkTarget {
+        target: String,
+    },
     Ok,
     Error {
         errno: Errno,

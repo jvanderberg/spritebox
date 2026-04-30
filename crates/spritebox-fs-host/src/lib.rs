@@ -90,6 +90,12 @@ pub trait HostFs: Send + Sync + 'static {
     async fn truncate(&self, path: &Path, size: u64) -> Result<()>;
     async fn chmod(&self, path: &Path, mode: u16) -> Result<()>;
     async fn fsync(&self, path: &Path) -> Result<()>;
+    /// Create a symlink at `path` pointing to the literal `target`
+    /// string. The target is not validated (symlinks can dangle).
+    /// Returns the new symlink's [`FileAttr`].
+    async fn symlink(&self, path: &Path, target: &str) -> Result<FileAttr>;
+    /// Read the target of a symlink at `path`.
+    async fn readlink(&self, path: &Path) -> Result<String>;
     async fn list_dir(&self, path: &Path) -> Result<Vec<DirChild>>;
     /// Snapshot the entire tree as `(path, kind, content)` triples.
     /// Used by tests as an equivalence oracle.

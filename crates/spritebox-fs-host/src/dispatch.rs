@@ -168,6 +168,12 @@ impl<F: HostFs> Dispatcher<F> {
             }
             Request::Truncate { ino, size } => self.truncate(ino, size).await,
             Request::Chmod { ino, mode } => self.chmod(ino, mode).await,
+            Request::Symlink {
+                parent,
+                name,
+                target,
+            } => self.symlink(parent, &name, &target).await,
+            Request::ReadLink { ino } => self.readlink(ino).await,
             Request::Fsync { ino, .. } => self.fsync(ino).await,
             Request::StatFs { .. } => Response::StatFs(default_statfs()),
         }
@@ -527,6 +533,38 @@ impl<F: HostFs> Dispatcher<F> {
                 self.generations.lock().await.bump(ino);
                 Response::Ok
             }
+            Err(err) => Response::Error { errno: err.errno() },
+        }
+    }
+
+    async fn symlink(
+        &self,
+        parent: spritebox_fs_protocol::Ino,
+        name: &str,
+        target: &str,
+    ) -> Response {
+        let parent_path = match self.resolve_ino(parent).await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let path = parent_path.join(name);
+        match self.fs.symlink(&path, target).await {
+            Ok(mut attr) => {
+                let mut inodes = self.inodes.lock().await;
+                attr.ino = inodes.intern(&path);
+                Response::Entry { attr }
+            }
+            Err(err) => Response::Error { errno: err.errno() },
+        }
+    }
+
+    async fn readlink(&self, ino: spritebox_fs_protocol::Ino) -> Response {
+        let path = match self.resolve_ino(ino).await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        match self.fs.readlink(&path).await {
+            Ok(target) => Response::LinkTarget { target },
             Err(err) => Response::Error { errno: err.errno() },
         }
     }

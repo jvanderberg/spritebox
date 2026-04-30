@@ -666,6 +666,40 @@ impl<S: FrameSink> RemoteFs for CachedRemote<S> {
         result
     }
 
+    async fn symlink(
+        &self,
+        parent: Ino,
+        name: &str,
+        target: &str,
+    ) -> ClientResult<FileAttr> {
+        let attr = self.inner.symlink(parent, name, target).await?;
+        let mut s = self.state.lock().await;
+        let now = Instant::now();
+        s.lookups.insert(
+            (parent, name.to_string()),
+            LookupEntry::Found {
+                attr: attr.clone(),
+                expires_at: now + self.config.lookup_ttl,
+            },
+        );
+        s.attrs.insert(
+            attr.ino,
+            AttrEntry {
+                attr: attr.clone(),
+                expires_at: now + self.config.attr_ttl,
+            },
+        );
+        Ok(attr)
+    }
+
+    async fn readlink(&self, ino: Ino) -> ClientResult<String> {
+        // Symlink targets are immutable from the FUSE perspective —
+        // they don't change without a Push::InvalidateData on the
+        // symlink ino. For now just pass through; cache later if
+        // readlink shows up as a hot path.
+        self.inner.readlink(ino).await
+    }
+
     async fn fsync(&self, ino: Ino, handle: u64, data_only: bool) -> ClientResult<()> {
         self.inner.fsync(ino, handle, data_only).await
     }

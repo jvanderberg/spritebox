@@ -213,6 +213,13 @@ pub trait RemoteFs: Send + Sync + 'static {
     ) -> ClientResult<()>;
     async fn truncate(&self, ino: Ino, size: u64) -> ClientResult<()>;
     async fn chmod(&self, ino: Ino, mode: u16) -> ClientResult<()>;
+    async fn symlink(
+        &self,
+        parent: Ino,
+        name: &str,
+        target: &str,
+    ) -> ClientResult<FileAttr>;
+    async fn readlink(&self, ino: Ino) -> ClientResult<String>;
     async fn fsync(&self, ino: Ino, handle: u64, data_only: bool) -> ClientResult<()>;
     async fn statfs(&self, ino: Ino) -> ClientResult<StatFs>;
 }
@@ -454,6 +461,30 @@ impl<S: FrameSink> RemoteFs for PassthroughRemote<S> {
 
     async fn chmod(&self, ino: Ino, mode: u16) -> ClientResult<()> {
         unwrap_ok(self.req(Request::Chmod { ino, mode }).await?)
+    }
+
+    async fn symlink(
+        &self,
+        parent: Ino,
+        name: &str,
+        target: &str,
+    ) -> ClientResult<FileAttr> {
+        unwrap_attr(
+            self.req(Request::Symlink {
+                parent,
+                name: name.to_string(),
+                target: target.to_string(),
+            })
+            .await?,
+        )
+    }
+
+    async fn readlink(&self, ino: Ino) -> ClientResult<String> {
+        match self.req(Request::ReadLink { ino }).await? {
+            Response::LinkTarget { target } => Ok(target),
+            Response::Error { errno } => Err(ClientError::Errno(errno)),
+            _ => Err(ClientError::Protocol),
+        }
     }
 
     async fn fsync(&self, ino: Ino, handle: u64, data_only: bool) -> ClientResult<()> {

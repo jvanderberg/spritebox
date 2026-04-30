@@ -554,6 +554,53 @@ impl Filesystem for SpriteboxFs {
         });
     }
 
+    fn symlink(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let name = match link_name.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                reply.error(e::EINVAL);
+                return;
+            }
+        };
+        let target = match target.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                reply.error(e::EINVAL);
+                return;
+            }
+        };
+        fuse_call!(
+            self,
+            "fuse.symlink",
+            { parent, name = name.as_str(), target = target.as_str() },
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.symlink(parent as Ino, &name, &target).await
+            },
+            reply,
+            |reply: ReplyEntry, attr: PAttr| reply.entry(&ENTRY_TTL, &to_fuse_attr(&attr), GENERATION)
+        );
+    }
+
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        fuse_call!(
+            self,
+            "fuse.readlink",
+            { ino },
+            move |remote: std::sync::Arc<dyn RemoteFs>| async move {
+                remote.readlink(ino as Ino).await
+            },
+            reply,
+            |reply: ReplyData, target: String| reply.data(target.as_bytes())
+        );
+    }
+
     fn fsync(
         &mut self,
         _req: &Request,

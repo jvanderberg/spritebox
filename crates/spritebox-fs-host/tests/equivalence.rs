@@ -179,6 +179,39 @@ async fn equivalence_path_escape_rejected_consistently() {
 }
 
 #[tokio::test]
+async fn equivalence_symlink_create_and_read() {
+    let mem = MemFs::with_clock(FakeClock::new(1_000_000));
+    let dir = tempfile::tempdir().unwrap();
+    let tokio = TokioFs::new(dir.path().to_path_buf());
+
+    // Create the target file then a symlink pointing to it.
+    mem.create(Path::new("real.txt"), 0o644).await.unwrap();
+    mem.write(Path::new("real.txt"), 0, b"hello").await.unwrap();
+    mem.symlink(Path::new("link.txt"), "real.txt").await.unwrap();
+
+    tokio.create(Path::new("real.txt"), 0o644).await.unwrap();
+    tokio.write(Path::new("real.txt"), 0, b"hello").await.unwrap();
+    tokio
+        .symlink(Path::new("link.txt"), "real.txt")
+        .await
+        .unwrap();
+
+    // Both should report the link as a symlink, with the target string.
+    let mem_attr = mem.stat(Path::new("link.txt")).await.unwrap();
+    let tokio_attr = tokio.stat(Path::new("link.txt")).await.unwrap();
+    assert_eq!(mem_attr.kind, spritebox_fs_protocol::FileKind::Symlink);
+    assert_eq!(tokio_attr.kind, spritebox_fs_protocol::FileKind::Symlink);
+    assert_eq!(
+        mem.readlink(Path::new("link.txt")).await.unwrap(),
+        "real.txt"
+    );
+    assert_eq!(
+        tokio.readlink(Path::new("link.txt")).await.unwrap(),
+        "real.txt"
+    );
+}
+
+#[tokio::test]
 async fn equivalence_chmod_changes_mode() {
     let mem = MemFs::with_clock(FakeClock::new(1_000_000));
     let dir = tempfile::tempdir().unwrap();

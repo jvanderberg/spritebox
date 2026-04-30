@@ -66,6 +66,7 @@ impl Clock for FakeClock {
 enum Node {
     File { content: Bytes, mode: u16 },
     Dir { children: BTreeMap<String, Ino>, mode: u16 },
+    Symlink { target: String, mode: u16 },
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +84,7 @@ impl InodeEntry {
         match self.node {
             Node::File { .. } => FileKind::Regular,
             Node::Dir { .. } => FileKind::Directory,
+            Node::Symlink { .. } => FileKind::Symlink,
         }
     }
 }
@@ -177,6 +179,13 @@ impl Inner {
             Node::Dir { children, mode } => {
                 (children.len() as u64, *mode, FileKind::Directory, 1, 2)
             }
+            Node::Symlink { target, mode } => (
+                target.len() as u64,
+                *mode,
+                FileKind::Symlink,
+                1,
+                1,
+            ),
         };
         Ok(FileAttr {
             ino,
@@ -391,7 +400,9 @@ impl HostFs for MemFs {
         };
         let target = inner.inodes.get(&target_ino).ok_or(HostError::NotFound)?;
         match &target.node {
-            Node::File { .. } => return Err(HostError::NotADirectory),
+            Node::File { .. } | Node::Symlink { .. } => {
+                return Err(HostError::NotADirectory);
+            }
             Node::Dir { children, .. } => {
                 if !children.is_empty() {
                     return Err(HostError::NotEmpty);
@@ -509,7 +520,9 @@ impl HostFs for MemFs {
         let now = self.clock.now_ns();
         let entry = inner.inodes.get_mut(&ino).ok_or(HostError::NotFound)?;
         match &mut entry.node {
-            Node::File { mode, .. } | Node::Dir { mode, .. } => {
+            Node::File { mode, .. }
+            | Node::Dir { mode, .. }
+            | Node::Symlink { mode, .. } => {
                 *mode = new_mode & 0o7777;
             }
         }
@@ -522,6 +535,56 @@ impl HostFs for MemFs {
         let inner = self.inner.lock().await;
         inner.resolve(path)?;
         Ok(())
+    }
+
+    async fn symlink(&self, path: &Path, target: &str) -> Result<FileAttr> {
+        check_relative(path)?;
+        let mut inner = self.inner.lock().await;
+        let now = self.clock.now_ns();
+        let (parent_ino, name) = inner.split_parent(path)?;
+        let name = name.to_string();
+        {
+            let parent_entry = inner.inodes.get(&parent_ino).ok_or(HostError::NotFound)?;
+            let Node::Dir { children, .. } = &parent_entry.node else {
+                return Err(HostError::NotADirectory);
+            };
+            if children.contains_key(&name) {
+                return Err(HostError::AlreadyExists);
+            }
+        }
+        let ino = inner.alloc_ino();
+        inner.inodes.insert(
+            ino,
+            InodeEntry {
+                parent: Some(parent_ino),
+                name: name.clone(),
+                node: Node::Symlink {
+                    target: target.to_string(),
+                    mode: 0o777,
+                },
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
+            },
+        );
+        let parent_entry = inner.inodes.get_mut(&parent_ino).unwrap();
+        if let Node::Dir { children, .. } = &mut parent_entry.node {
+            children.insert(name, ino);
+            parent_entry.mtime_ns = now;
+            parent_entry.ctime_ns = now;
+        }
+        inner.attr(ino)
+    }
+
+    async fn readlink(&self, path: &Path) -> Result<String> {
+        check_relative(path)?;
+        let inner = self.inner.lock().await;
+        let ino = inner.resolve(path)?;
+        let entry = inner.inodes.get(&ino).ok_or(HostError::NotFound)?;
+        match &entry.node {
+            Node::Symlink { target, .. } => Ok(target.clone()),
+            _ => Err(HostError::InvalidName),
+        }
     }
 
     async fn list_dir(&self, path: &Path) -> Result<Vec<DirChild>> {
@@ -577,6 +640,9 @@ fn snapshot_walk(
             for (name, child_ino) in children {
                 snapshot_walk(inner, *child_ino, path.join(name), out);
             }
+        }
+        Node::Symlink { .. } => {
+            out.push((path, FileKind::Symlink, None));
         }
     }
 }

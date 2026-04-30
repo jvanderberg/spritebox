@@ -40,11 +40,13 @@ impl TokioFs {
     }
 
     async fn stat_inner(abs: &Path) -> Result<FileAttr> {
-        let meta = fs::metadata(abs).await.map_err(map_io)?;
-        let kind = if meta.is_dir() {
-            FileKind::Directory
-        } else if meta.file_type().is_symlink() {
+        // symlink_metadata reports on the link itself, not its target —
+        // matches POSIX lstat() semantics, which is what FUSE expects.
+        let meta = fs::symlink_metadata(abs).await.map_err(map_io)?;
+        let kind = if meta.file_type().is_symlink() {
             FileKind::Symlink
+        } else if meta.is_dir() {
+            FileKind::Directory
         } else {
             FileKind::Regular
         };
@@ -229,6 +231,61 @@ impl HostFs for TokioFs {
         let abs = self.resolve(path)?;
         let f = fs::File::open(&abs).await.map_err(map_io)?;
         f.sync_all().await.map_err(map_io)
+    }
+
+    async fn symlink(&self, path: &Path, target: &str) -> Result<FileAttr> {
+        let abs = self.resolve(path)?;
+        #[cfg(unix)]
+        {
+            tokio::fs::symlink(target, &abs).await.map_err(map_io)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (target, abs);
+            return Err(HostError::Io("symlinks unsupported on this OS".into()));
+        }
+        // lstat-equivalent: stat_inner uses fs::metadata which follows
+        // symlinks. We need symlink_metadata for the link itself.
+        let meta = fs::symlink_metadata(&abs).await.map_err(map_io)?;
+        let kind = if meta.file_type().is_symlink() {
+            FileKind::Symlink
+        } else if meta.is_dir() {
+            FileKind::Directory
+        } else {
+            FileKind::Regular
+        };
+        let to_ns = |t: std::io::Result<std::time::SystemTime>| -> i64 {
+            t.ok()
+                .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0)
+        };
+        let mtime = to_ns(meta.modified());
+        let atime = to_ns(meta.accessed());
+        let ctime = to_ns(meta.created());
+        let (ino, mode, nlink, uid, gid, blocks) = unix_attr(&meta);
+        Ok(FileAttr {
+            ino,
+            size: meta.len(),
+            blocks,
+            atime_ns: atime,
+            mtime_ns: mtime,
+            ctime_ns: ctime,
+            kind,
+            mode,
+            nlink,
+            uid,
+            gid,
+        })
+    }
+
+    async fn readlink(&self, path: &Path) -> Result<String> {
+        let abs = self.resolve(path)?;
+        let target = fs::read_link(&abs).await.map_err(map_io)?;
+        target
+            .into_os_string()
+            .into_string()
+            .map_err(|_| HostError::InvalidName)
     }
 
     async fn list_dir(&self, path: &Path) -> Result<Vec<DirChild>> {
