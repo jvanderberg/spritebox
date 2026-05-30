@@ -18,6 +18,11 @@ pub struct SpritesClient {
 // API types
 // ---------------------------------------------------------------------------
 
+/// Sprites API create request.
+/// As of 2026-03, the API only accepts `name` and `url_settings`.
+/// `config` and `environment` are NOT honored by the API — memory autoscales
+/// from 2GB to 16GB based on demand. Do not add a stop endpoint either;
+/// sprites auto-sleep after idle and there is no stop API.
 #[derive(Debug, Serialize)]
 pub struct CreateSpriteRequest {
     pub name: String,
@@ -27,6 +32,9 @@ pub struct CreateSpriteRequest {
     pub environment: Option<std::collections::HashMap<String, String>>,
 }
 
+/// NOTE: As of 2026-03, the Sprites API ignores these fields. Memory autoscales
+/// (2GB base, up to 16GB). This struct is kept for forward-compatibility in case
+/// the API adds config support later, but don't rely on it actually working.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SpriteConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,21 +215,6 @@ impl SpritesClient {
             .map_err(|e| format!("failed to parse sprite list: {e}"))
     }
 
-    pub async fn stop_sprite(&self, name: &str) -> Result<(), String> {
-        let resp = self
-            .http
-            .post(format!("{API_BASE}/v1/sprites/{name}/stop"))
-            .send()
-            .await
-            .map_err(|e| format!("stop sprite request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(api_error(resp).await);
-        }
-
-        Ok(())
-    }
-
     pub async fn delete_sprite(&self, name: &str) -> Result<(), String> {
         let resp = self
             .http
@@ -326,6 +319,21 @@ impl SpritesClient {
         stdin_data: &[u8],
         timeout: std::time::Duration,
     ) -> Result<ExecResult, String> {
+        self.exec_binary_with_timeout(sprite_name, cmd, env, dir, stdin_data, timeout)
+            .await
+            .map(Into::into)
+    }
+
+    /// Binary-clean variant of `exec_with_timeout`.
+    pub async fn exec_binary_with_timeout(
+        &self,
+        sprite_name: &str,
+        cmd: &[&str],
+        env: &[(&str, &str)],
+        dir: Option<&str>,
+        stdin_data: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<BinaryExecResult, String> {
         if self.verbose {
             let cmd_preview: String = cmd.join(" ");
             let preview = if cmd_preview.len() > 80 {
@@ -391,11 +399,31 @@ impl SpritesClient {
         }
 
         // Fallback: direct exec WebSocket (Go SDK: direct dial with 10s timeout)
+        // IMPORTANT: This MUST retry with backoff within the overall timeout.
+        // Freshly created sprites take 10-20s to boot and won't accept connections
+        // immediately. A single connect attempt will fail on first launch.
         let exec_url = self.build_exec_url(&exec_params)?;
-        if self.verbose {
-            eprintln!("[exec] connecting direct websocket...");
-        }
-        let (ws, _) = self.connect_ws(&exec_url).await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut attempt = 0u32;
+        let ws = loop {
+            attempt += 1;
+            if self.verbose {
+                eprintln!("[exec] connecting direct websocket (attempt {attempt})...");
+            }
+            match self.connect_ws(&exec_url).await {
+                Ok((ws, _)) => break ws,
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    let backoff = std::time::Duration::from_secs(2u64.min(attempt as u64));
+                    if self.verbose {
+                        eprintln!("[exec] connect failed: {e}, retrying in {}s...", backoff.as_secs());
+                    }
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        };
         if self.verbose {
             eprintln!("[exec] connected, running command...");
         }
@@ -422,7 +450,7 @@ impl SpritesClient {
         sink: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
         stream: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
         stdin_data: &[u8],
-    ) -> Result<ExecResult, String> {
+    ) -> Result<BinaryExecResult, String> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut exit_code: Option<i32> = None;
@@ -486,23 +514,24 @@ impl SpritesClient {
             }
         }
 
-        Ok(ExecResult {
+        Ok(BinaryExecResult {
             exit_code: exit_code.unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout,
+            stderr,
         })
     }
 
     // -- Interactive console (TTY) ------------------------------------------
 
-    /// Open an interactive TTY console session. This takes over the terminal
-    /// and returns the exit code when the session ends.
-    pub async fn console(
+    /// Console with optional repo/branch context for the message board bridge.
+    pub async fn console_with_context(
         &self,
         sprite_name: &str,
         cmd: &[&str],
         env: &[(&str, &str)],
         dir: Option<&str>,
+        repo: Option<&str>,
+        branch: Option<&str>,
     ) -> Result<i32, String> {
         let (cols, rows) = crossterm::terminal::size()
             .map_err(|e| format!("failed to get terminal size: {e}"))?;
@@ -555,6 +584,8 @@ impl SpritesClient {
         let bridge = BridgeContext {
             client: self.clone(),
             sprite_name: sprite_name.to_string(),
+            repo: repo.map(str::to_string),
+            branch: branch.map(str::to_string),
         };
 
         // Enter raw terminal mode
@@ -705,6 +736,52 @@ impl SpritesClient {
                     sink.send(Message::Text(resize.to_string().into()))
                         .await
                         .map_err(|e| format!("ws write error: {e}"))?;
+                }
+            }
+        }
+    }
+
+    // -- Long-lived exec (for the FS share daemon) --------------------------
+
+    /// Open an exec WebSocket and return it ready for the caller to drive.
+    /// Used by long-running daemons where the lifecycle is managed by
+    /// higher-level code, not by the exec_inner exit-message loop.
+    pub async fn open_exec(
+        &self,
+        sprite_name: &str,
+        cmd: &[&str],
+        env: &[(&str, &str)],
+        dir: Option<&str>,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        String,
+    > {
+        let params = ExecParams {
+            sprite_name,
+            cmd,
+            env,
+            dir,
+            tty: false,
+            rows: None,
+            cols: None,
+        };
+        let url = self.build_exec_url(&params)?;
+        // Retry with exponential backoff for 30s — sprite may be cold.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self.connect_ws(&url).await {
+                Ok((ws, _)) => return Ok(ws),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    let backoff =
+                        std::time::Duration::from_secs(2u64.min(attempt as u64));
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
@@ -874,6 +951,23 @@ pub struct ExecResult {
     pub stderr: String,
 }
 
+#[derive(Debug)]
+pub struct BinaryExecResult {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl From<BinaryExecResult> for ExecResult {
+    fn from(b: BinaryExecResult) -> Self {
+        ExecResult {
+            exit_code: b.exit_code,
+            stdout: String::from_utf8_lossy(&b.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&b.stderr).into_owned(),
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -886,6 +980,10 @@ pub struct ExecResult {
 struct BridgeContext {
     client: SpritesClient,
     sprite_name: String,
+    /// Repo URL — needed for message board (identifies which board to use).
+    repo: Option<String>,
+    /// Branch name — needed for message board (identifies this sprite's branch).
+    branch: Option<String>,
 }
 
 /// OSC 9999 escape sequence format:
@@ -1060,8 +1158,99 @@ fn handle_bridge_command(cmd: &str, bridge: &BridgeContext) {
                 });
             }
         }
+        // -- Message board verbs -----------------------------------------------
+        v @ ("msg-register" | "msg-leader-post" | "msg-send" | "msg-send-leader"
+            | "msg-branches" | "msg-list" | "msg-new" | "msg-from-leader"
+            | "msg-set-leader") =>
+        {
+            let client = bridge.client.clone();
+            let sprite = bridge.sprite_name.clone();
+            let repo = bridge.repo.clone();
+            let branch = bridge.branch.clone();
+            let verb = v.to_string();
+            let payload = payload.to_string();
+            tokio::spawn(async move {
+                let result = handle_msg_verb(&verb, &payload, &sprite, repo.as_deref(), branch.as_deref());
+                // Write response back to sprite via exec so we can set permissions.
+                // Using write_file (filesystem API) creates root-owned files that the
+                // guest user cannot delete, breaking the sprite-msg polling mechanism.
+                let response = match result {
+                    Ok(json) => json,
+                    Err(e) => serde_json::json!({"error": e}).to_string(),
+                };
+                let write_cmd = "cat > /tmp/spritebox-msg-response.json && chmod 666 /tmp/spritebox-msg-response.json";
+                if let Err(e) = client
+                    .exec_with_stdin(
+                        &sprite,
+                        &["bash", "-c", write_cmd],
+                        &[],
+                        None,
+                        response.as_bytes(),
+                    )
+                    .await
+                {
+                    eprintln!("\r\n[bridge] msg response write failed: {e}\r");
+                }
+            });
+        }
         _ => {}
     }
+}
+
+fn handle_msg_verb(
+    verb: &str,
+    payload: &str,
+    sprite_name: &str,
+    repo: Option<&str>,
+    branch: Option<&str>,
+) -> Result<String, String> {
+    let repo = repo.ok_or("message board requires --repo mode")?;
+    let branch = branch.ok_or("message board requires --branch")?;
+    let board = crate::msgboard::Board::open(repo);
+
+    let json = match verb {
+        "msg-register" => {
+            let branches = board.register(branch, sprite_name)?;
+            serde_json::to_string(&branches).map_err(|e| e.to_string())?
+        }
+        "msg-leader-post" => {
+            let msgs = board.leader_post(branch, sprite_name, payload)?;
+            serde_json::to_string(&msgs).map_err(|e| e.to_string())?
+        }
+        "msg-send" => {
+            // Payload format: "<to-branch>;<message body>"
+            let (to, body) = payload.split_once(';')
+                .ok_or("msg-send payload must be: <to-branch>;<message>")?;
+            let msg = board.send(branch, sprite_name, to, body)?;
+            serde_json::to_string(&msg).map_err(|e| e.to_string())?
+        }
+        "msg-send-leader" => {
+            let msg = board.send_to_leader(branch, sprite_name, payload)?;
+            serde_json::to_string(&msg).map_err(|e| e.to_string())?
+        }
+        "msg-branches" => {
+            let branches = board.list_branches();
+            serde_json::to_string(&branches).map_err(|e| e.to_string())?
+        }
+        "msg-list" => {
+            let messages = board.list_all(branch);
+            serde_json::to_string(&messages).map_err(|e| e.to_string())?
+        }
+        "msg-new" => {
+            let messages = board.list_new(branch);
+            serde_json::to_string(&messages).map_err(|e| e.to_string())?
+        }
+        "msg-from-leader" => {
+            let messages = board.list_from_leader_new(branch);
+            serde_json::to_string(&messages).map_err(|e| e.to_string())?
+        }
+        "msg-set-leader" => {
+            let branches = board.set_leader(branch)?;
+            serde_json::to_string(&branches).map_err(|e| e.to_string())?
+        }
+        _ => return Err(format!("unknown msg verb: {verb}")),
+    };
+    Ok(json)
 }
 
 /// Allowed file extensions for the `open` bridge verb.
@@ -1243,5 +1432,105 @@ async fn api_error(resp: reqwest::Response) -> String {
             format!("API error ({status}): {msg}")
         }
         Err(_) => format!("API error ({status})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Probe: verify the exec WebSocket transport is binary-clean in both
+    /// directions. Sends a torture payload (every byte value plus the protocol's
+    /// own in-band control bytes 0x00–0x05 and long NUL runs) to `cat` on a
+    /// real sprite and asserts the bytes come back identical.
+    ///
+    /// Requires a running sprite. Set `SPRITEBOX_TEST_SPRITE=<name>` and a
+    /// valid token (via `SPRITEBOX_TOKEN`, `SPRITES_TOKEN`, or
+    /// `spritebox auth login`), then run:
+    ///
+    ///   cargo test ws_binary_roundtrip -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn ws_binary_roundtrip() {
+        let sprite = match std::env::var("SPRITEBOX_TEST_SPRITE") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                eprintln!("skipping: set SPRITEBOX_TEST_SPRITE to a sprite name");
+                return;
+            }
+        };
+        let token = crate::auth::load_token().expect(
+            "no Sprites token; set SPRITEBOX_TOKEN or run `spritebox auth login`",
+        );
+
+        let client = SpritesClient::new(token).expect("build client");
+
+        let mut payload = Vec::with_capacity(8192);
+        for _ in 0..16 {
+            for b in 0u16..=255 {
+                payload.push(b as u8);
+            }
+        }
+        for ctrl in [0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05] {
+            for _ in 0..256 {
+                payload.push(ctrl);
+            }
+        }
+        payload.extend(std::iter::repeat_n(0u8, 1024));
+        for i in 0..512u16 {
+            payload.push((i & 0xff) as u8);
+        }
+
+        eprintln!(
+            "sending {} bytes to {} via exec(cat)",
+            payload.len(),
+            sprite
+        );
+
+        let result = client
+            .exec_binary_with_timeout(
+                &sprite,
+                &["cat"],
+                &[],
+                None,
+                &payload,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("exec failed");
+
+        assert_eq!(
+            result.exit_code,
+            0,
+            "cat exit code: stderr={}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        if result.stdout == payload {
+            eprintln!("ok: {} bytes round-tripped exactly", payload.len());
+            return;
+        }
+
+        let len = payload.len().min(result.stdout.len());
+        let mut mismatch_at = len;
+        for i in 0..len {
+            if payload[i] != result.stdout[i] {
+                mismatch_at = i;
+                break;
+            }
+        }
+        let ctx_start = mismatch_at.saturating_sub(8);
+        let ctx_end_in = (mismatch_at + 8).min(payload.len());
+        let ctx_end_out = (mismatch_at + 8).min(result.stdout.len());
+
+        eprintln!("MISMATCH at offset {} (0x{:x})", mismatch_at, mismatch_at);
+        eprintln!(
+            "  lengths: input={} output={}",
+            payload.len(),
+            result.stdout.len()
+        );
+        eprintln!("  expected: {:02x?}", &payload[ctx_start..ctx_end_in]);
+        eprintln!("  actual:   {:02x?}", &result.stdout[ctx_start..ctx_end_out]);
+        panic!("binary round-trip differed");
     }
 }

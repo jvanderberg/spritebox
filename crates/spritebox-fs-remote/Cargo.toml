@@ -1,0 +1,18 @@
+[package]
+name = "spritebox-fs-remote"
+version = "0.1.0"
+edition = "2024"
+description = "Sprite-side filesystem client for the spritebox virtual filesystem"
+license = "MIT"
+
+[dependencies]
+spritebox-fs-protocol = { workspace = true }
+spritebox-fs-transport = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+spritebox-fs-host = { workspace = true }

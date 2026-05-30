@@ -1,3 +1,28 @@
+[workspace]
+members = [
+    ".",
+    "crates/spritebox-fs-protocol",
+    "crates/spritebox-fs-host",
+    "crates/spritebox-fs-transport",
+    "crates/spritebox-fs-remote",
+    "crates/spritebox-fs-tests",
+    "crates/spritebox-fs-fuse",
+    "crates/spritebox-fsd",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+bytes = { version = "1", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+spritebox-fs-protocol = { path = "crates/spritebox-fs-protocol" }
+spritebox-fs-transport = { path = "crates/spritebox-fs-transport" }
+spritebox-fs-host = { path = "crates/spritebox-fs-host" }
+spritebox-fs-remote = { path = "crates/spritebox-fs-remote" }
+spritebox-fs-fuse = { path = "crates/spritebox-fs-fuse" }
+tracing = "0.1"
+postcard = { version = "1", features = ["alloc"] }
+
 [package]
 name = "spritebox"
 version = "0.1.0"
@@ -5,6 +30,13 @@ edition = "2024"
 description = "Branch-scoped development environments powered by Fly.io Sprites"
 license = "MIT"
 repository = "https://github.com/jvanderberg/spritebox"
+build = "build.rs"
+
+[lints.rust]
+# `daemon_embedded` is a custom cfg flag set by build.rs when the
+# spritebox-fsd binary is found and embedded. Declaring it here
+# silences "unexpected cfg condition" warnings from rustc.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(daemon_embedded)"] }
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -14,8 +46,15 @@ http = "1"
 petname = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 rpassword = "7.4.0"
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 url = "2"
+spritebox-fs-protocol = { workspace = true }
+spritebox-fs-transport = { workspace = true }
+spritebox-fs-host = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

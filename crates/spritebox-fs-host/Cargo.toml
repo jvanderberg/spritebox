@@ -1,0 +1,19 @@
+[package]
+name = "spritebox-fs-host"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side filesystem abstraction for the spritebox virtual filesystem"
+license = "MIT"
+
+[dependencies]
+spritebox-fs-protocol = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+notify = "8"
+notify-debouncer-full = "0.6"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

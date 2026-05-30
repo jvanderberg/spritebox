@@ -29,7 +29,7 @@ auto-sleep after 30 seconds of inactivity, and wake automatically when you recon
 Storage persists across sleep/wake cycles.
 
 spritebox handles:
-- Sprite lifecycle (create, connect, stop, destroy)
+- Sprite lifecycle (create, connect, destroy)
 - User provisioning (matching your local username)
 - Git clone and credential setup (HTTPS via GH_TOKEN)
 - Config sync (Claude, Codex, GitHub configs pushed from host)
@@ -47,9 +47,19 @@ Interactive sessions use WebSocket connections to the Sprites API — no SSH nee
 
 ### Install
 
+**Easiest — prebuilt binary:** download from the [releases page](https://github.com/jvanderberg/spritebox/releases) and put it on your `$PATH`. Each release ships single-binary builds for macOS (Intel + Apple Silicon), Linux x86_64, and Windows x86_64. The `spritebox-fsd` daemon for the FUSE share feature is embedded in the binary — no separate install.
+
+**From source:** if you're building locally and want the `--share` feature, you need to build the cross-compiled Linux daemon first because the sprite runs Linux:
+
 ```bash
+# Linux host: native build, just needs `rustup target add x86_64-unknown-linux-gnu` once
+# macOS host: builds inside a Docker container (Docker Desktop or OrbStack required)
+./scripts/build-daemon.sh
+
 cargo install --path .
 ```
+
+Without the daemon build step, spritebox compiles and runs but `--share` will refuse with a helpful error. CI does the daemon build automatically.
 
 ### Authenticate
 
@@ -96,7 +106,6 @@ spritebox exec --repo git@github.com:org/repo.git --branch main -- ls /workspace
 
 ```bash
 spritebox list                                              # all sprites and their status
-spritebox stop --name repo-main                             # stop a running sprite
 spritebox destroy --name repo-main                          # delete a sprite
 spritebox destroy --repo git@github.com:org/repo.git --branch main --yes
 ```

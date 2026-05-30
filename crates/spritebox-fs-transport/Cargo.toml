@@ -1,0 +1,16 @@
+[package]
+name = "spritebox-fs-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Transport abstraction and fault-injecting in-memory transport for the spritebox virtual filesystem"
+license = "MIT"
+
+[dependencies]
+spritebox-fs-protocol = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
