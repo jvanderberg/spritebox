@@ -299,9 +299,13 @@ async fn launch(options: LaunchOptions) -> Result<(), String> {
     if options.verbose {
         eprintln!("setting up user {user}...", user = options.user);
     }
+    // The sprite base image ships `claude`/`codex` under /home/sprite/.local/bin,
+    // which is mode 750 group `sprite`. Put the per-host user in the `sprite`
+    // group so they can traverse it and exec those CLIs.
     let setup_cmds = format!(
         "apt-get install -y -qq ncurses-base > /dev/null 2>&1; \
-         id -u {user} >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo {user}; \
+         id -u {user} >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo,sprite {user}; \
+         usermod -aG sprite {user}; \
          echo '{user} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{user} \
          && chown root:root /etc/sudoers.d/{user} && chmod 0440 /etc/sudoers.d/{user}; \
          chmod a+r /etc/profile.d/languages_* 2>/dev/null; \

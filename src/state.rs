@@ -1,3 +1,6 @@
+/// DNS label limit — the upper bound the Sprites API accepts for sprite names.
+const MAX_SPRITE_NAME_LEN: usize = 63;
+
 /// Derive a sprite name from the instance selector (repo+branch, name, or base).
 pub fn sprite_name(
     name: Option<&str>,
@@ -21,7 +24,13 @@ pub fn sprite_name(
                     "repo and branch must contain at least one alphanumeric character".to_string(),
                 );
             }
-            Ok(format!("{repo_slug}-{branch_slug}"))
+            // Cap the auto-generated <repo>-<branch> name to the DNS label limit.
+            // For --name (above), trust the user's literal input.
+            let combined: String = format!("{repo_slug}-{branch_slug}")
+                .chars()
+                .take(MAX_SPRITE_NAME_LEN)
+                .collect();
+            Ok(combined.trim_end_matches('-').to_string())
         }
         (Some(_), _, _) => Err("--name cannot be combined with --repo/--branch".to_string()),
         (None, Some(_), None) | (None, None, Some(_)) => {
@@ -62,7 +71,7 @@ pub fn slugify(value: &str) -> String {
         }
     }
 
-    slug.trim_matches('-').chars().take(48).collect()
+    slug.trim_matches('-').to_string()
 }
 
 #[cfg(test)]
@@ -102,9 +111,24 @@ mod tests {
     }
 
     #[test]
-    fn slug_truncates_at_48_chars() {
-        let long_name = "a".repeat(100);
-        let name = sprite_name(Some(&long_name), None, None).unwrap();
-        assert_eq!(name.len(), 48);
+    fn explicit_name_is_not_truncated() {
+        // The Sprites API accepts names up to DNS-label length; for --name we
+        // trust the user's literal input. Regression for the 48-char cap that
+        // made spritebox destroy refuse to find existing long-named sprites.
+        let long_name = "kicad-jlcimport-claude-investigate-new-issue-y1xx8"; // 50 chars
+        let name = sprite_name(Some(long_name), None, None).unwrap();
+        assert_eq!(name, long_name);
+    }
+
+    #[test]
+    fn repo_branch_caps_at_dns_label_limit() {
+        let long_branch = "a".repeat(100);
+        let name = sprite_name(
+            None,
+            Some("git@github.com:org/my-repo.git"),
+            Some(&long_branch),
+        )
+        .unwrap();
+        assert!(name.len() <= 63);
     }
 }
